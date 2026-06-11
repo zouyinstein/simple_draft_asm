@@ -10,7 +10,13 @@ rescue supported closing links.
 ## Build
 
 ```bash
-cargo build --release
+/Users/zouyinstein-m4max/.cargo/bin/cargo build --release
+```
+
+If you want plain `cargo` to work in a new terminal, add Rust to `PATH` first:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
 ## Quick runs
