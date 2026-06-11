@@ -87,24 +87,27 @@ annotation/pathfinder.
 | --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: |
 | OATK/syncasm | mito | `-k 1001 -c 30` | 0.99s | 1.01s | 0.02s | `benchmarks/oatk_mito/oatk_mito.utg.final.gfa` | 9 | 24 | 364,639 |
 | OATK/syncasm | plastid | `-k 1001 -c 30` | 2.74s | 3.38s | 0.08s | `benchmarks/oatk_plastid/oatk_plastid.utg.final.gfa` | 3 | 8 | 132,513 |
-| simple_draft_asm | mito | `--rounds 1` | 1.87s | 1.47s | 0.18s | `benchmarks/simple_mito_1round/graph.gfa` | 19 | 36 | 376,128 |
-| simple_draft_asm | mito | default mito, 2 rounds | 2.56s | 6.00s | 0.32s | `benchmarks/simple_mito/graph.gfa` | 19 | 46 | 376,128 |
-| simple_draft_asm | plastid | default plastid, 1 round | 4.04s | 3.89s | 0.19s | `benchmarks/simple_plastid/graph.gfa` | 3 | 8 | 129,833 |
+| simple_draft_asm | mito | `--rounds 1` | 1.61s | 1.23s | 0.16s | `benchmarks/simple_mito_1round/graph.gfa` | 19 | 36 | 376,128 |
+| simple_draft_asm | mito | default mito, 2 rounds | 2.22s | 5.97s | 0.32s | `benchmarks/simple_mito/graph.gfa` | 19 | 46 | 376,128 |
+| simple_draft_asm | plastid | default plastid, 1 round | 3.07s | 3.58s | 0.19s | `benchmarks/simple_plastid/graph.gfa` | 3 | 8 | 129,833 |
 | Flye | mito | `--genome-size 500k` | 226.27s | 700.85s | 2.22s | `benchmarks/flye_mito_full/assembly_graph.gfa` | 12 | 17 | 370,282 |
 | Flye | plastid | `--genome-size 160k` | >10m50s | n/a | n/a | aborted during read extension | n/a | n/a | n/a |
 
 Speed summary:
 
-- Mito: OATK/syncasm was about 1.9x faster than simple_draft_asm `--rounds 1`
-  and about 2.6x faster than simple_draft_asm's default two-round run.
-- Mito: Flye was about 88.4x slower than simple_draft_asm's default two-round
+- Mito: OATK/syncasm was about 1.6x faster than simple_draft_asm `--rounds 1`
+  and about 2.2x faster than simple_draft_asm's default two-round run.
+- Mito: Flye was about 101.9x slower than simple_draft_asm's default two-round
   run and about 228.6x slower than OATK/syncasm.
-- Plastid: OATK/syncasm was about 1.5x faster than simple_draft_asm.
+- Plastid: OATK/syncasm was about 1.1x faster than simple_draft_asm.
 - Flye plastid was not completed because the high-coverage run was still in read
   extension after more than 10 minutes.
 - The default simple_draft_asm mito two-round path now reuses the first-round
   anchor assembly when writing the readlink rescue graph, avoiding a duplicate
   first-round assembly pass.
+- The simple_draft_asm anchor pass avoids repeated k-mer/suffix string
+  allocation in hot loops; this keeps graph output unchanged while reducing
+  runtime.
 
 Benchmark commands:
 

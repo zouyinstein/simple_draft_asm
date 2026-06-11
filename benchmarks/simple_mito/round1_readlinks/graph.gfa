@@ -26,9 +26,9 @@ L	utg1	+	utg18	-	0M	RC:i:21	JL:Z:read
 L	utg2	+	utg13	-	0M	RC:i:12	JL:Z:terminal
 L	utg2	+	utg14	+	0M	RC:i:14	JL:Z:read
 L	utg2	+	utg15	+	0M	RC:i:78	JL:Z:terminal
-L	utg2	-	utg3	+	0M	RC:i:86	JL:Z:terminal
+L	utg2	-	utg3	+	0M	RC:i:74	JL:Z:terminal
 L	utg3	+	utg8	+	0M	RC:i:80	JL:Z:terminal
-L	utg3	-	utg2	+	0M	RC:i:86	JL:Z:terminal
+L	utg3	-	utg2	+	0M	RC:i:74	JL:Z:terminal
 L	utg4	+	utg13	+	0M	RC:i:66	JL:Z:read
 L	utg4	-	utg14	-	0M	RC:i:32	JL:Z:read
 L	utg4	-	utg16	+	0M	RC:i:32	JL:Z:read

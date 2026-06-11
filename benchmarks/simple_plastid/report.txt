@@ -1,5 +1,5 @@
 simple_draft_asm report
-elapsed_seconds	3.347
+elapsed_seconds	3.030
 reads_seen	15686
 bases_seen	282096323
 raw_anchor_hits	1204718

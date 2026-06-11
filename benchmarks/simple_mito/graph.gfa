@@ -46,9 +46,9 @@ L	utg17	-	utg9	-	0M	RC:i:102	SK:i:102	PA:i:80	RS:i:0	LR:f:1.0000	SC:Z:skeleton+p
 L	utg18	+	utg12	-	0M	RC:i:97	SK:i:97	PA:i:19	RS:i:0	LR:f:1.0000	SC:Z:skeleton+paf
 L	utg18	-	utg14	-	0M	RC:i:111	SK:i:111	PA:i:85	RS:i:0	LR:f:1.0000	SC:Z:skeleton+paf
 L	utg2	+	utg15	+	0M	RC:i:78	SK:i:78	PA:i:54	RS:i:0	LR:f:1.0000	SC:Z:skeleton+paf
-L	utg2	-	utg3	+	0M	RC:i:86	SK:i:86	PA:i:51	RS:i:0	LR:f:1.0000	SC:Z:skeleton+paf
+L	utg2	-	utg3	+	0M	RC:i:74	SK:i:74	PA:i:51	RS:i:0	LR:f:1.0000	SC:Z:skeleton+paf
 L	utg3	+	utg8	+	0M	RC:i:80	SK:i:80	PA:i:64	RS:i:0	LR:f:1.0000	SC:Z:skeleton+paf
-L	utg3	-	utg2	+	0M	RC:i:86	SK:i:86	PA:i:64	RS:i:0	LR:f:1.0000	SC:Z:skeleton+paf
+L	utg3	-	utg2	+	0M	RC:i:74	SK:i:74	PA:i:64	RS:i:0	LR:f:1.0000	SC:Z:skeleton+paf
 L	utg4	+	utg13	+	0M	RC:i:66	SK:i:0	PA:i:0	RS:i:66	LR:f:0.0000	SC:Z:rescue
 L	utg4	-	utg14	-	0M	RC:i:32	SK:i:0	PA:i:0	RS:i:32	LR:f:0.0000	SC:Z:rescue
 L	utg4	-	utg16	+	0M	RC:i:32	SK:i:0	PA:i:0	RS:i:32	LR:f:0.0000	SC:Z:rescue
