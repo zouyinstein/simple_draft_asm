@@ -1352,12 +1352,11 @@ fn process_read(
 ) -> io::Result<()> {
     assembly.reads_seen += 1;
     assembly.bases_seen += seq.len() as u64;
+    let seq_bytes = seq.as_bytes();
 
     let raw_hits = match config.anchor_mode {
-        AnchorMode::Syncmer => {
-            select_syncmer_hits(seq.as_bytes(), config.k, config.s, config.syncmer_pos)
-        }
-        AnchorMode::Minimizer => select_minimizer_hits(seq.as_bytes(), config.k, config.window),
+        AnchorMode::Syncmer => select_syncmer_hits(seq_bytes, config.k, config.s, config.syncmer_pos),
+        AnchorMode::Minimizer => select_minimizer_hits(seq_bytes, config.k, config.window),
     };
     let raw_hits = thin_anchor_hits(raw_hits, config.min_anchor_spacing);
 
@@ -1366,7 +1365,7 @@ fn process_read(
     let mut hits: Vec<AnchorHit> = Vec::with_capacity(raw_hits.len());
     let mut last_state: Option<usize> = None;
     for pos in raw_hits {
-        let Some((canonical, is_forward)) = canonical_kmer(seq.as_bytes(), pos, config.k) else {
+        let Some((canonical, is_forward)) = canonical_kmer(seq_bytes, pos, config.k) else {
             continue;
         };
         let node_id = match assembly.key_to_node.get(&canonical) {
@@ -1394,7 +1393,6 @@ fn process_read(
         return Ok(());
     }
 
-    let seq_bytes = seq.as_bytes();
     let mut read_edges = Vec::with_capacity(hits.len().saturating_sub(1));
     for pair in hits.windows(2) {
         let left = pair[0];
@@ -1407,26 +1405,31 @@ fn process_read(
         if suffix_end < suffix_start {
             continue;
         }
-        let suffix =
-            String::from_utf8_lossy(&seq_bytes[suffix_start..suffix_end]).to_ascii_uppercase();
         let span = right.pos.saturating_sub(left.pos);
         let edge_key = EdgeKey {
             from: left.state,
             to: right.state,
         };
-        let entry = assembly.edges.entry(edge_key).or_insert_with(|| EdgeStats {
-            coverage: 0,
-            total_span: 0,
-            min_span: span,
-            max_span: span,
-            suffix: suffix.clone(),
-        });
-        entry.coverage += 1;
-        entry.total_span += span as u64;
-        entry.min_span = entry.min_span.min(span);
-        entry.max_span = entry.max_span.max(span);
-        if suffix.len() > entry.suffix.len() {
-            entry.suffix = suffix;
+        let suffix_len = suffix_end.saturating_sub(suffix_start);
+        if let Some(entry) = assembly.edges.get_mut(&edge_key) {
+            entry.coverage += 1;
+            entry.total_span += span as u64;
+            entry.min_span = entry.min_span.min(span);
+            entry.max_span = entry.max_span.max(span);
+            if suffix_len > entry.suffix.len() {
+                entry.suffix = ascii_uppercase_string(&seq_bytes[suffix_start..suffix_end]);
+            }
+        } else {
+            assembly.edges.insert(
+                edge_key,
+                EdgeStats {
+                    coverage: 1,
+                    total_span: span as u64,
+                    min_span: span,
+                    max_span: span,
+                    suffix: ascii_uppercase_string(&seq_bytes[suffix_start..suffix_end]),
+                },
+            );
         }
         read_edges.push(edge_key);
     }
@@ -1610,21 +1613,38 @@ fn canonical_kmer(seq: &[u8], pos: usize, k: usize) -> Option<(String, bool)> {
         return None;
     }
 
-    let mut forward = Vec::with_capacity(k);
-    for &base in slice {
-        forward.push(base.to_ascii_uppercase());
-    }
-
-    let mut reverse = Vec::with_capacity(k);
-    for &base in slice.iter().rev() {
-        reverse.push(complement(base.to_ascii_uppercase()));
-    }
-
-    if forward <= reverse {
-        Some((String::from_utf8(forward).expect("ACGT is UTF-8"), true))
+    if forward_leq_revcomp(slice) {
+        Some((ascii_uppercase_string(slice), true))
     } else {
-        Some((String::from_utf8(reverse).expect("ACGT is UTF-8"), false))
+        Some((revcomp_bytes_string(slice), false))
     }
+}
+
+fn forward_leq_revcomp(slice: &[u8]) -> bool {
+    for i in 0..slice.len() {
+        let left = slice[i].to_ascii_uppercase();
+        let right = complement(slice[slice.len() - 1 - i].to_ascii_uppercase());
+        if left != right {
+            return left < right;
+        }
+    }
+    true
+}
+
+fn ascii_uppercase_string(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        out.push(byte.to_ascii_uppercase() as char);
+    }
+    out
+}
+
+fn revcomp_bytes_string(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &byte in bytes.iter().rev() {
+        out.push(complement(byte.to_ascii_uppercase()) as char);
+    }
+    out
 }
 
 fn state_id(node_id: usize, is_forward: bool) -> usize {
