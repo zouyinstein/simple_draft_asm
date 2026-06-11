@@ -161,6 +161,7 @@ struct Unitig {
 
 struct AnchorAssemblyResult {
     assembly: Assembly,
+    edge_junction_support: HashMap<EdgeKey, u32>,
     graph: FilteredGraph,
     compressed: CompressedGraph,
     junctions: HashMap<(usize, usize), u32>,
@@ -313,19 +314,21 @@ fn compute_anchor_assembly(config: &Config) -> io::Result<AnchorAssemblyResult> 
         }
     }
 
-    let graph = build_filtered_graph(&config, &assembly);
+    let edge_junction_support = edge_junction_support(&assembly);
+    let graph = build_filtered_graph(&config, &assembly, &edge_junction_support);
     let compressed = compress_unitigs(&config, &assembly, &graph);
     let junctions = count_unitig_junctions(&assembly, &compressed.edge_to_unitig);
     let link_support = count_link_support(&assembly, &compressed.edge_to_placement);
 
     let full_config = full_graph_config(&config);
-    let full_graph = build_filtered_graph(&full_config, &assembly);
+    let full_graph = build_filtered_graph(&full_config, &assembly, &edge_junction_support);
     let full_compressed = compress_unitigs(&full_config, &assembly, &full_graph);
     let full_junctions = count_unitig_junctions(&assembly, &full_compressed.edge_to_unitig);
     let full_link_support = count_link_support(&assembly, &full_compressed.edge_to_placement);
 
     Ok(AnchorAssemblyResult {
         assembly,
+        edge_junction_support,
         graph,
         compressed,
         junctions,
@@ -346,8 +349,8 @@ fn write_anchor_assembly_outputs(
     write_anchors(&config, &result.assembly, &result.graph)?;
     write_edges(
         &config,
-        &result.assembly,
         &result.graph,
+        &result.edge_junction_support,
         &result.compressed.edge_to_unitig,
     )?;
     write_unitigs(&config, &result.compressed.unitigs, "unitigs.fasta")?;
@@ -1251,6 +1254,9 @@ where
     F: FnMut(&str, &str) -> io::Result<bool>,
 {
     let mut header = first_header;
+    let mut seq = String::new();
+    let mut plus = String::new();
+    let mut qual = String::new();
     loop {
         if !header.starts_with('@') {
             return Err(io::Error::new(
@@ -1260,9 +1266,9 @@ where
         }
         let name = header[1..].split_whitespace().next().unwrap_or("");
 
-        let mut seq = String::new();
-        let mut plus = String::new();
-        let mut qual = String::new();
+        seq.clear();
+        plus.clear();
+        qual.clear();
         if reader.read_line(&mut seq)? == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -1702,19 +1708,27 @@ fn revcomp_string(seq: &str) -> String {
 }
 
 fn stable_hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    stable_hash_bytes_seed(bytes, 0xcbf2_9ce4_8422_2325, 0x1000_0000_01b3)
+}
+
+fn stable_hash_bytes_seed(bytes: &[u8], seed: u64, multiplier: u64) -> u64 {
+    let mut hash = seed;
     for &byte in bytes {
         hash ^= byte.to_ascii_uppercase() as u64;
-        hash = hash.wrapping_mul(0x1000_0000_01b3);
+        hash = hash.wrapping_mul(multiplier);
     }
     hash
 }
 
 fn stable_hash_revcomp(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    stable_hash_revcomp_seed(bytes, 0xcbf2_9ce4_8422_2325, 0x1000_0000_01b3)
+}
+
+fn stable_hash_revcomp_seed(bytes: &[u8], seed: u64, multiplier: u64) -> u64 {
+    let mut hash = seed;
     for &byte in bytes.iter().rev() {
         hash ^= complement(byte) as u64;
-        hash = hash.wrapping_mul(0x1000_0000_01b3);
+        hash = hash.wrapping_mul(multiplier);
     }
     hash
 }
@@ -1733,8 +1747,11 @@ struct FilteredGraph {
     incoming: HashMap<usize, Vec<EdgeKey>>,
 }
 
-fn build_filtered_graph(config: &Config, assembly: &Assembly) -> FilteredGraph {
-    let edge_junction_support = edge_junction_support(assembly);
+fn build_filtered_graph(
+    config: &Config,
+    assembly: &Assembly,
+    edge_junction_support: &HashMap<EdgeKey, u32>,
+) -> FilteredGraph {
     let mut candidates = Vec::new();
     let mut outgoing_rank: HashMap<usize, Vec<(EdgeKey, u32)>> = HashMap::new();
     let mut incoming_rank: HashMap<usize, Vec<(EdgeKey, u32)>> = HashMap::new();
@@ -2388,12 +2405,11 @@ fn write_anchors(config: &Config, assembly: &Assembly, graph: &FilteredGraph) ->
 
 fn write_edges(
     config: &Config,
-    assembly: &Assembly,
     graph: &FilteredGraph,
+    junction_support: &HashMap<EdgeKey, u32>,
     edge_to_unitig: &HashMap<EdgeKey, usize>,
 ) -> io::Result<()> {
     let mut out = File::create(config.out_dir.join("edges.tsv"))?;
-    let junction_support = edge_junction_support(assembly);
     writeln!(
         out,
         "edge_id\tfrom_anchor\tfrom_orient\tto_anchor\tto_orient\tcoverage\tmax_raw_junction_support\tmean_span\tmin_span\tmax_span\tunitig"

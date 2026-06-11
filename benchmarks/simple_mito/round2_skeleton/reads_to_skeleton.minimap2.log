@@ -1,10 +1,10 @@
-[M::mm_idx_gen::0.003*1.37] collected minimizers
-[M::mm_idx_gen::0.005*3.04] sorted minimizers
-[M::main::0.005*3.04] loaded/built the index for 19 target sequence(s)
-[M::mm_mapopt_update::0.005*2.88] mid_occ = 50
+[M::mm_idx_gen::0.003*1.39] collected minimizers
+[M::mm_idx_gen::0.005*3.33] sorted minimizers
+[M::main::0.005*3.32] loaded/built the index for 19 target sequence(s)
+[M::mm_mapopt_update::0.005*3.15] mid_occ = 50
 [M::mm_idx_stat] kmer size: 19; skip: 19; is_hpc: 0; #seq: 19
-[M::mm_idx_stat::0.005*2.76] distinct minimizers: 34871 (93.66% are singletons); average occurrences: 1.076; average spacing: 10.022; total length: 376128
-[M::worker_pipeline::0.880*5.39] mapped 4747 sequences
+[M::mm_idx_stat::0.006*3.02] distinct minimizers: 34871 (93.66% are singletons); average occurrences: 1.076; average spacing: 10.022; total length: 376128
+[M::worker_pipeline::0.860*5.43] mapped 4747 sequences
 [M::main] Version: 2.30-r1287
 [M::main] CMD: minimap2 -x map-hifi -t 8 benchmarks/simple_mito/round2_skeleton/skeleton.segments.fasta data/mito.fastq.gz
-[M::main] Real time: 0.882 sec; CPU: 4.749 sec; Peak RSS: 0.107 GB
+[M::main] Real time: 0.861 sec; CPU: 4.671 sec; Peak RSS: 0.106 GB

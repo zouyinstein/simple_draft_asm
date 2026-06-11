@@ -1,5 +1,5 @@
 simple_draft_asm two-round report
-elapsed_seconds	2.203
+elapsed_seconds	2.172
 organelle	mito
 rounds	2
 round1_skeleton	benchmarks/simple_mito/round1_skeleton

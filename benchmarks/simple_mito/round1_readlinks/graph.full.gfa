@@ -105,12 +105,12 @@ L	utg13	-	utg53	+	0M	RC:i:33	JL:Z:read
 L	utg14	+	utg35	-	0M	RC:i:12	JL:Z:terminal
 L	utg14	+	utg38	+	0M	RC:i:80	JL:Z:terminal
 L	utg14	+	utg44	+	0M	RC:i:78	JL:Z:terminal
-L	utg14	-	utg16	+	0M	RC:i:86	JL:Z:terminal
+L	utg14	-	utg16	+	0M	RC:i:74	JL:Z:terminal
 L	utg15	+	utg19	-	0M	RC:i:21	JL:Z:terminal
 L	utg15	+	utg20	-	0M	RC:i:76	JL:Z:terminal
 L	utg15	-	utg45	+	0M	RC:i:86	JL:Z:terminal
 L	utg16	+	utg29	+	0M	RC:i:100	JL:Z:terminal
-L	utg16	-	utg14	+	0M	RC:i:86	JL:Z:terminal
+L	utg16	-	utg14	+	0M	RC:i:74	JL:Z:terminal
 L	utg17	+	utg47	+	0M	RC:i:22	JL:Z:terminal
 L	utg17	-	utg45	-	0M	RC:i:16	JL:Z:read
 L	utg18	+	utg36	-	0M	RC:i:73	JL:Z:terminal
@@ -166,7 +166,7 @@ L	utg30	+	utg33	+	0M	RC:i:60	JL:Z:terminal
 L	utg30	+	utg46	+	0M	RC:i:102	JL:Z:terminal
 L	utg30	-	utg27	-	0M	RC:i:91	JL:Z:terminal
 L	utg30	-	utg31	+	0M	RC:i:98	JL:Z:terminal
-L	utg31	+	utg35	-	0M	RC:i:81	JL:Z:terminal
+L	utg31	+	utg35	-	0M	RC:i:80	JL:Z:terminal
 L	utg31	+	utg44	+	0M	RC:i:11	JL:Z:terminal
 L	utg31	-	utg30	+	0M	RC:i:98	JL:Z:terminal
 L	utg32	+	utg55	+	0M	RC:i:55	JL:Z:read
@@ -179,7 +179,7 @@ L	utg34	-	utg35	+	0M	RC:i:94	JL:Z:terminal
 L	utg35	+	utg14	-	0M	RC:i:12	JL:Z:terminal
 L	utg35	+	utg25	-	0M	RC:i:19	JL:Z:read
 L	utg35	+	utg28	-	0M	RC:i:19	JL:Z:read
-L	utg35	+	utg31	-	0M	RC:i:81	JL:Z:terminal
+L	utg35	+	utg31	-	0M	RC:i:80	JL:Z:terminal
 L	utg35	-	utg34	+	0M	RC:i:94	JL:Z:terminal
 L	utg35	-	utg36	+	0M	RC:i:95	JL:Z:terminal
 L	utg36	+	utg18	-	0M	RC:i:73	JL:Z:terminal
