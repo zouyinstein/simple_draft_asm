@@ -159,6 +159,18 @@ struct Unitig {
     coverage: f64,
 }
 
+struct AnchorAssemblyResult {
+    assembly: Assembly,
+    graph: FilteredGraph,
+    compressed: CompressedGraph,
+    junctions: HashMap<(usize, usize), u32>,
+    link_support: HashMap<(UnitigEnd, UnitigEnd), u32>,
+    full_graph: FilteredGraph,
+    full_compressed: CompressedGraph,
+    full_junctions: HashMap<(usize, usize), u32>,
+    full_link_support: HashMap<(UnitigEnd, UnitigEnd), u32>,
+}
+
 enum TextReader {
     Plain(BufReader<File>),
     Gzip {
@@ -236,7 +248,21 @@ fn run(config: Config, started: Instant) -> io::Result<()> {
 }
 
 fn run_anchor_assembly(config: &Config, started: Instant) -> io::Result<()> {
-    fs::create_dir_all(&config.out_dir)?;
+    let result = compute_anchor_assembly(config)?;
+    write_anchor_assembly_outputs(config, &result, started)?;
+
+    if config.run_minimap2 {
+        run_minimap2(config)?;
+    }
+
+    if config.skeleton_gfa.is_some() {
+        run_skeleton_linking(config)?;
+    }
+
+    Ok(())
+}
+
+fn compute_anchor_assembly(config: &Config) -> io::Result<AnchorAssemblyResult> {
     let mut assembly = Assembly {
         nodes: Vec::new(),
         key_to_node: HashMap::new(),
@@ -298,46 +324,65 @@ fn run_anchor_assembly(config: &Config, started: Instant) -> io::Result<()> {
     let full_junctions = count_unitig_junctions(&assembly, &full_compressed.edge_to_unitig);
     let full_link_support = count_link_support(&assembly, &full_compressed.edge_to_placement);
 
-    write_anchors(&config, &assembly, &graph)?;
-    write_edges(&config, &assembly, &graph, &compressed.edge_to_unitig)?;
-    write_unitigs(&config, &compressed.unitigs, "unitigs.fasta")?;
-    write_unitigs(&config, &full_compressed.unitigs, "unitigs.full.fasta")?;
+    Ok(AnchorAssemblyResult {
+        assembly,
+        graph,
+        compressed,
+        junctions,
+        link_support,
+        full_graph,
+        full_compressed,
+        full_junctions,
+        full_link_support,
+    })
+}
+
+fn write_anchor_assembly_outputs(
+    config: &Config,
+    result: &AnchorAssemblyResult,
+    started: Instant,
+) -> io::Result<()> {
+    fs::create_dir_all(&config.out_dir)?;
+    write_anchors(&config, &result.assembly, &result.graph)?;
+    write_edges(
+        &config,
+        &result.assembly,
+        &result.graph,
+        &result.compressed.edge_to_unitig,
+    )?;
+    write_unitigs(&config, &result.compressed.unitigs, "unitigs.fasta")?;
+    write_unitigs(
+        &config,
+        &result.full_compressed.unitigs,
+        "unitigs.full.fasta",
+    )?;
     write_gfa(
         &config,
-        &compressed.unitigs,
-        &compressed.state_starts,
-        &compressed.state_ends,
-        &link_support,
+        &result.compressed.unitigs,
+        &result.compressed.state_starts,
+        &result.compressed.state_ends,
+        &result.link_support,
         "graph.gfa",
     )?;
     write_gfa(
         &config,
-        &full_compressed.unitigs,
-        &full_compressed.state_starts,
-        &full_compressed.state_ends,
-        &full_link_support,
+        &result.full_compressed.unitigs,
+        &result.full_compressed.state_starts,
+        &result.full_compressed.state_ends,
+        &result.full_link_support,
         "graph.full.gfa",
     )?;
-    write_junctions(&config, &junctions, "junctions.tsv")?;
-    write_junctions(&config, &full_junctions, "junctions.full.tsv")?;
+    write_junctions(&config, &result.junctions, "junctions.tsv")?;
+    write_junctions(&config, &result.full_junctions, "junctions.full.tsv")?;
     write_report(
         &config,
-        &assembly,
-        &graph,
-        &full_graph,
-        &compressed.unitigs,
-        &full_compressed.unitigs,
+        &result.assembly,
+        &result.graph,
+        &result.full_graph,
+        &result.compressed.unitigs,
+        &result.full_compressed.unitigs,
         started.elapsed(),
     )?;
-
-    if config.run_minimap2 {
-        run_minimap2(&config)?;
-    }
-
-    if config.skeleton_gfa.is_some() {
-        run_skeleton_linking(&config)?;
-    }
-
     Ok(())
 }
 
@@ -357,12 +402,13 @@ fn run_two_rounds(config: &Config, started: Instant) -> io::Result<()> {
     round1.read_junction_links = false;
     round1.min_link_support = round1.min_link_support.min(10);
     round1.run_minimap2 = false;
-    run_anchor_assembly(&round1, started)?;
+    let round1_result = compute_anchor_assembly(&round1)?;
+    write_anchor_assembly_outputs(&round1, &round1_result, started)?;
 
     let mut round1_readlinks = round1.clone();
     round1_readlinks.out_dir = round1_readlinks_dir.clone();
     round1_readlinks.read_junction_links = true;
-    run_anchor_assembly(&round1_readlinks, started)?;
+    write_anchor_assembly_outputs(&round1_readlinks, &round1_result, started)?;
 
     let mut round2 = config.clone();
     round2.out_dir = round2_dir.clone();

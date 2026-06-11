@@ -1,0 +1,13 @@
+skeleton_gfa	benchmarks/simple_mito/round1_skeleton/graph.gfa
+segments	19
+links_total	62
+links_kept	46
+skeleton_end_slop	1500
+skeleton_min_link_support	10
+skeleton_min_link_ratio	0.2
+skeleton_rescue_gfa	benchmarks/simple_mito/round1_readlinks/graph.gfa
+skeleton_rescue_link_support	20
+minimap_min_identity	0.95
+minimap_min_align_len	500
+paf_max_link_gap	2000
+output_gfa	skeleton.linked.gfa

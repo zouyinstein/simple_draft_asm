@@ -65,6 +65,61 @@ These were regenerated with the quick commands above:
 | `result_mito_profile_default/round1_readlinks` | `graph.gfa` | 19 | 64 | 376,128 | 741 | 61,105 |
 | `result_mito_profile_default/round2_skeleton` | `skeleton.linked.gfa` | 19 | 46 | 376,128 | 741 | 61,105 |
 
+## Benchmark
+
+Benchmark date: 2026-06-11/12. Commands were run on this machine:
+
+- Model: Mac Studio `Mac16,9`
+- Chip: Apple M4 Max, 14 cores (10 performance + 4 efficiency)
+- Memory: 36 GB
+- OS: macOS 26.5.1 (25F80)
+- Threads: `-t 8`
+- Inputs: `data/mito.fastq.gz` 73 MB, `data/plastid.fastq.gz` 235 MB
+- Tool versions: Flye `2.9.6-b1802`, minimap2 `2.30-r1287`,
+  OATK/syncasm `1.0`, simple_draft_asm `0.1.0`
+
+Runtime was measured with `/usr/bin/time -p`. OATK was installed from
+`c-zhou/oatk` under `external/oatk` and compiled with `make -j8`. The benchmark
+uses OATK's core graph assembler `syncasm`, not the full `oatk` wrapper with HMM
+annotation/pathfinder.
+
+| tool | dataset | command profile | real | user | sys | output graph | S | L | bases |
+| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: |
+| OATK/syncasm | mito | `-k 1001 -c 30` | 0.99s | 1.01s | 0.02s | `benchmarks/oatk_mito/oatk_mito.utg.final.gfa` | 9 | 24 | 364,639 |
+| OATK/syncasm | plastid | `-k 1001 -c 30` | 2.74s | 3.38s | 0.08s | `benchmarks/oatk_plastid/oatk_plastid.utg.final.gfa` | 3 | 8 | 132,513 |
+| simple_draft_asm | mito | `--rounds 1` | 1.87s | 1.47s | 0.18s | `benchmarks/simple_mito_1round/graph.gfa` | 19 | 36 | 376,128 |
+| simple_draft_asm | mito | default mito, 2 rounds | 2.56s | 6.00s | 0.32s | `benchmarks/simple_mito/graph.gfa` | 19 | 46 | 376,128 |
+| simple_draft_asm | plastid | default plastid, 1 round | 4.04s | 3.89s | 0.19s | `benchmarks/simple_plastid/graph.gfa` | 3 | 8 | 129,833 |
+| Flye | mito | `--genome-size 500k` | 226.27s | 700.85s | 2.22s | `benchmarks/flye_mito_full/assembly_graph.gfa` | 12 | 17 | 370,282 |
+| Flye | plastid | `--genome-size 160k` | >10m50s | n/a | n/a | aborted during read extension | n/a | n/a | n/a |
+
+Speed summary:
+
+- Mito: OATK/syncasm was about 1.9x faster than simple_draft_asm `--rounds 1`
+  and about 2.6x faster than simple_draft_asm's default two-round run.
+- Mito: Flye was about 88.4x slower than simple_draft_asm's default two-round
+  run and about 228.6x slower than OATK/syncasm.
+- Plastid: OATK/syncasm was about 1.5x faster than simple_draft_asm.
+- Flye plastid was not completed because the high-coverage run was still in read
+  extension after more than 10 minutes.
+- The default simple_draft_asm mito two-round path now reuses the first-round
+  anchor assembly when writing the readlink rescue graph, avoiding a duplicate
+  first-round assembly pass.
+
+Benchmark commands:
+
+```bash
+/usr/bin/time -p ./target/release/simple_draft_asm --organelle mito -i data/mito.fastq.gz -o benchmarks/simple_mito -t 8
+/usr/bin/time -p ./target/release/simple_draft_asm --organelle mito --rounds 1 -i data/mito.fastq.gz -o benchmarks/simple_mito_1round -t 8
+/usr/bin/time -p ./target/release/simple_draft_asm --organelle plastid -i data/plastid.fastq.gz -o benchmarks/simple_plastid -t 8
+
+/usr/bin/time -p external/oatk/syncasm -k 1001 -c 30 -t 8 -o benchmarks/oatk_mito/oatk_mito data/mito.fastq.gz
+/usr/bin/time -p external/oatk/syncasm -k 1001 -c 30 -t 8 -o benchmarks/oatk_plastid/oatk_plastid data/plastid.fastq.gz
+
+/usr/bin/time -p /opt/homebrew/bin/flye --pacbio-hifi data/mito.fastq.gz --extra-params output_gfa_before_rr=1 --genome-size 500k -t 8 -o benchmarks/flye_mito_full
+/usr/bin/time -p /opt/homebrew/bin/flye --pacbio-hifi data/plastid.fastq.gz --extra-params output_gfa_before_rr=1 --genome-size 160k -t 8 -o benchmarks/flye_plastid_full
+```
+
 ## Help
 
 Common options are shown with:

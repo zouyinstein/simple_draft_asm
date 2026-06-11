@@ -1,0 +1,5 @@
+from_unitig	to_unitig	count	from_total	frequency
+utg0	utg1	3	5	0.600000
+utg0	utg2	2	5	0.400000
+utg1	utg2	1476	1476	1.000000
+utg2	utg0	1353	1353	1.000000
