@@ -1355,7 +1355,9 @@ fn process_read(
     let seq_bytes = seq.as_bytes();
 
     let raw_hits = match config.anchor_mode {
-        AnchorMode::Syncmer => select_syncmer_hits(seq_bytes, config.k, config.s, config.syncmer_pos),
+        AnchorMode::Syncmer => {
+            select_syncmer_hits(seq_bytes, config.k, config.s, config.syncmer_pos)
+        }
         AnchorMode::Minimizer => select_minimizer_hits(seq_bytes, config.k, config.window),
     };
     let raw_hits = thin_anchor_hits(raw_hits, config.min_anchor_spacing);
