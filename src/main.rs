@@ -1664,7 +1664,7 @@ fn node_id_from_state(state: usize) -> usize {
 }
 
 fn state_orientation(state: usize) -> char {
-    if state.is_multiple_of(2) {
+    if state % 2 == 0 {
         '+'
     } else {
         '-'
@@ -1672,7 +1672,7 @@ fn state_orientation(state: usize) -> char {
 }
 
 fn oriented_anchor_seq(node: &AnchorNode, state: usize) -> String {
-    if state.is_multiple_of(2) {
+    if state % 2 == 0 {
         node.seq.clone()
     } else {
         revcomp_string(&node.seq)
