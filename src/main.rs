@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::time::Instant;
@@ -81,6 +81,7 @@ struct Config {
     min_unitig_len: usize,
     min_tip_len: usize,
     min_link_support: u32,
+    min_link_ratio: f64,
     read_junction_links: bool,
     bidirectional_links: bool,
     junction_rescue_support: u32,
@@ -102,8 +103,52 @@ struct Config {
     skeleton_rescue_gfa: Option<PathBuf>,
     skeleton_rescue_link_support: u32,
     rounds: usize,
+    read_subsets: Vec<ReadSubset>,
+    read_subsets_requested: bool,
+    read_subset_percent: ReadSubset,
     threads: usize,
     run_minimap2: bool,
+}
+
+const READ_SUBSET_SCALE: u16 = 10_000;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+struct ReadSubset {
+    basis_points: u16,
+}
+
+impl ReadSubset {
+    fn full() -> Self {
+        Self {
+            basis_points: READ_SUBSET_SCALE,
+        }
+    }
+
+    fn is_full(self) -> bool {
+        self.basis_points >= READ_SUBSET_SCALE
+    }
+
+    fn dir_label(self) -> String {
+        self.to_string().replace('.', "_")
+    }
+
+    fn includes_bucket(self, bucket: u16) -> bool {
+        self.basis_points >= READ_SUBSET_SCALE || bucket < self.basis_points
+    }
+}
+
+impl std::fmt::Display for ReadSubset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let whole = self.basis_points / 100;
+        let decimal = self.basis_points % 100;
+        if decimal == 0 {
+            write!(f, "{whole}")
+        } else if decimal % 10 == 0 {
+            write!(f, "{}.{}", whole, decimal / 10)
+        } else {
+            write!(f, "{}.{:02}", whole, decimal)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +217,16 @@ struct AnchorAssemblyResult {
     full_link_support: HashMap<(UnitigEnd, UnitigEnd), u32>,
 }
 
+struct ReadSubsetRun {
+    percent: ReadSubset,
+    config: Config,
+    assembly: Assembly,
+    target_bases: Option<u64>,
+    read_id_path: Option<PathBuf>,
+    read_id_writer: Option<BufWriter<File>>,
+    started: Instant,
+}
+
 enum TextReader {
     Plain(BufReader<File>),
     Gzip {
@@ -235,17 +290,118 @@ fn run(config: Config, started: Instant) -> io::Result<()> {
     validate_config(&config)?;
     fs::create_dir_all(&config.out_dir)?;
 
+    if config.read_subsets_requested {
+        run_read_subsets(config)?;
+        return Ok(());
+    }
+
+    run_single_config(&config, started)
+}
+
+fn run_single_config(config: &Config, started: Instant) -> io::Result<()> {
     if config.skeleton_only {
-        run_skeleton_linking(&config)?;
+        run_skeleton_linking(config)?;
         return Ok(());
     }
 
     if config.rounds >= 2 {
-        run_two_rounds(&config, started)?;
+        run_two_rounds(config, started)?;
         return Ok(());
     }
 
-    run_anchor_assembly(&config, started)
+    run_anchor_assembly(config, started)
+}
+
+fn run_read_subsets(config: Config) -> io::Result<()> {
+    fs::create_dir_all(&config.out_dir)?;
+
+    let mut runs: Vec<ReadSubsetRun> = Vec::new();
+    for subset in &config.read_subsets {
+        let mut subset_config = config.clone();
+        subset_config.out_dir = config
+            .out_dir
+            .join(format!("read_subset_{}", subset.dir_label()));
+        subset_config.read_subsets_requested = false;
+        subset_config.read_subsets = vec![*subset];
+        subset_config.read_subset_percent = *subset;
+
+        fs::create_dir_all(&subset_config.out_dir)?;
+        let read_id_path = if subset.is_full() {
+            None
+        } else {
+            Some(subset_config.out_dir.join("read_ids.txt"))
+        };
+        let read_id_writer = match &read_id_path {
+            Some(path) => Some(BufWriter::new(File::create(path)?)),
+            None => None,
+        };
+
+        runs.push(ReadSubsetRun {
+            percent: *subset,
+            target_bases: target_bases_for_config(&subset_config),
+            config: subset_config,
+            assembly: new_assembly(),
+            read_id_path,
+            read_id_writer,
+            started: Instant::now(),
+        });
+    }
+
+    let mut reads_loaded = 0u64;
+    'inputs: for path in &config.reads {
+        read_sequence_file(path, |name, seq| {
+            let read_index = reads_loaded;
+            reads_loaded += 1;
+
+            if seq.len() >= config.min_read_len {
+                let bucket = read_subset_bucket(name, read_index);
+                for run in &mut runs {
+                    if run.percent.includes_bucket(bucket)
+                        && !assembly_limit_reached(&run.config, &run.assembly, run.target_bases)
+                    {
+                        process_read(&run.config, &mut run.assembly, name, seq)?;
+                        if let Some(writer) = run.read_id_writer.as_mut() {
+                            writeln!(writer, "{name}")?;
+                        }
+                    }
+                }
+            }
+
+            Ok(!all_read_subset_runs_finished(&runs))
+        })?;
+
+        if all_read_subset_runs_finished(&runs) {
+            break 'inputs;
+        }
+    }
+
+    let mut summary = File::create(config.out_dir.join("read_subsets.tsv"))?;
+    writeln!(
+        summary,
+        "read_subset_percent\tout_dir\tread_ids_file\telapsed_seconds"
+    )?;
+
+    for mut run in runs {
+        if let Some(writer) = run.read_id_writer.as_mut() {
+            writer.flush()?;
+        }
+        let assembly = std::mem::replace(&mut run.assembly, new_assembly());
+        let result = finish_anchor_assembly(&run.config, assembly);
+        write_anchor_assembly_outputs(&run.config, &result, run.started)?;
+        writeln!(
+            summary,
+            "{}\t{}\t{}\t{:.3}",
+            run.percent,
+            run.config.out_dir.display(),
+            run.read_id_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            run.started.elapsed().as_secs_f64()
+        )?;
+    }
+
+    Ok(())
 }
 
 fn run_anchor_assembly(config: &Config, started: Instant) -> io::Result<()> {
@@ -264,7 +420,38 @@ fn run_anchor_assembly(config: &Config, started: Instant) -> io::Result<()> {
 }
 
 fn compute_anchor_assembly(config: &Config) -> io::Result<AnchorAssemblyResult> {
-    let mut assembly = Assembly {
+    let mut assembly = new_assembly();
+    let target_bases = target_bases_for_config(config);
+
+    let mut reads_loaded = 0u64;
+    'inputs: for path in &config.reads {
+        read_sequence_file(path, |name, seq| {
+            let read_index = reads_loaded;
+            reads_loaded += 1;
+            if seq.len() < config.min_read_len {
+                return Ok(true);
+            }
+            if !keep_read_for_subset(name, read_index, config.read_subset_percent) {
+                return Ok(true);
+            }
+            if assembly_limit_reached(config, &assembly, target_bases) {
+                return Ok(false);
+            }
+
+            process_read(&config, &mut assembly, name, seq)?;
+            Ok(true)
+        })?;
+
+        if assembly_limit_reached(config, &assembly, target_bases) {
+            break 'inputs;
+        }
+    }
+
+    Ok(finish_anchor_assembly(config, assembly))
+}
+
+fn new_assembly() -> Assembly {
+    Assembly {
         nodes: Vec::new(),
         key_to_node: HashMap::new(),
         edges: HashMap::new(),
@@ -273,47 +460,38 @@ fn compute_anchor_assembly(config: &Config) -> io::Result<AnchorAssemblyResult> 
         reads_seen: 0,
         bases_seen: 0,
         anchors_seen: 0,
-    };
+    }
+}
 
-    let target_bases = match (config.genome_size, config.asm_coverage) {
+fn target_bases_for_config(config: &Config) -> Option<u64> {
+    match (config.genome_size, config.asm_coverage) {
         (Some(genome_size), Some(coverage)) if coverage > 0.0 => {
             Some((genome_size as f64 * coverage).round() as u64)
         }
         _ => None,
-    };
+    }
+}
 
-    'inputs: for path in &config.reads {
-        read_sequence_file(path, |name, seq| {
-            if seq.len() < config.min_read_len {
-                return Ok(true);
-            }
-            if let Some(max_reads) = config.max_reads {
-                if assembly.reads_seen >= max_reads {
-                    return Ok(false);
-                }
-            }
-            if let Some(target) = target_bases {
-                if assembly.bases_seen >= target {
-                    return Ok(false);
-                }
-            }
-
-            process_read(&config, &mut assembly, name, seq)?;
-            Ok(true)
-        })?;
-
-        if let Some(max_reads) = config.max_reads {
-            if assembly.reads_seen >= max_reads {
-                break 'inputs;
-            }
-        }
-        if let Some(target) = target_bases {
-            if assembly.bases_seen >= target {
-                break 'inputs;
-            }
+fn assembly_limit_reached(config: &Config, assembly: &Assembly, target_bases: Option<u64>) -> bool {
+    if let Some(max_reads) = config.max_reads {
+        if assembly.reads_seen >= max_reads {
+            return true;
         }
     }
+    if let Some(target) = target_bases {
+        if assembly.bases_seen >= target {
+            return true;
+        }
+    }
+    false
+}
 
+fn all_read_subset_runs_finished(runs: &[ReadSubsetRun]) -> bool {
+    runs.iter()
+        .all(|run| assembly_limit_reached(&run.config, &run.assembly, run.target_bases))
+}
+
+fn finish_anchor_assembly(config: &Config, assembly: Assembly) -> AnchorAssemblyResult {
     let edge_junction_support = edge_junction_support(&assembly);
     let graph = build_filtered_graph(&config, &assembly, &edge_junction_support);
     let compressed = compress_unitigs(&config, &assembly, &graph);
@@ -326,7 +504,7 @@ fn compute_anchor_assembly(config: &Config) -> io::Result<AnchorAssemblyResult> 
     let full_junctions = count_unitig_junctions(&assembly, &full_compressed.edge_to_unitig);
     let full_link_support = count_link_support(&assembly, &full_compressed.edge_to_placement);
 
-    Ok(AnchorAssemblyResult {
+    AnchorAssemblyResult {
         assembly,
         edge_junction_support,
         graph,
@@ -337,7 +515,20 @@ fn compute_anchor_assembly(config: &Config) -> io::Result<AnchorAssemblyResult> 
         full_compressed,
         full_junctions,
         full_link_support,
-    })
+    }
+}
+
+fn keep_read_for_subset(name: &str, read_index: u64, percent: ReadSubset) -> bool {
+    percent.includes_bucket(read_subset_bucket(name, read_index))
+}
+
+fn read_subset_bucket(name: &str, read_index: u64) -> u16 {
+    let hash = if name.is_empty() {
+        mix64(read_index.wrapping_add(0x9e37_79b9_7f4a_7c15))
+    } else {
+        stable_hash_bytes_seed(name.as_bytes(), 0x9e37_79b9_7f4a_7c15, 0x1000_0000_01b3)
+    };
+    (mix64(hash) % READ_SUBSET_SCALE as u64) as u16
 }
 
 fn write_anchor_assembly_outputs(
@@ -520,6 +711,8 @@ fn write_two_round_report(
     writeln!(out, "containment_ratio\t{}", config.containment_ratio)?;
     writeln!(out, "min_tip_len\t{}", config.min_tip_len)?;
     writeln!(out, "min_link_support\t{}", config.min_link_support)?;
+    writeln!(out, "min_link_ratio\t{}", config.min_link_ratio)?;
+    writeln!(out, "read_subset_percent\t{}", config.read_subset_percent)?;
     writeln!(out, "skeleton_end_slop\t{}", config.skeleton_end_slop)?;
     writeln!(
         out,
@@ -615,6 +808,12 @@ fn validate_config(config: &Config) -> io::Result<()> {
             "--containment-ratio must be between 0 and 1",
         ));
     }
+    if !(0.0..=1.0).contains(&config.min_link_ratio) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--min-link-ratio must be between 0 and 1",
+        ));
+    }
     if !(0.0..1.0).contains(&config.hifi_error_rate) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -637,6 +836,37 @@ fn validate_config(config: &Config) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "--skeleton-min-link-ratio must be between 0 and 1",
+        ));
+    }
+    if config.read_subsets.is_empty()
+        || config
+            .read_subsets
+            .iter()
+            .any(|subset| subset.basis_points == 0 || subset.basis_points > READ_SUBSET_SCALE)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--read-subsets values must be between 1 and 100",
+        ));
+    }
+    if config.read_subset_percent.basis_points == 0
+        || config.read_subset_percent.basis_points > READ_SUBSET_SCALE
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "internal read subset percent must be between 1 and 100",
+        ));
+    }
+    if config.read_subsets_requested
+        && (config.rounds >= 2
+            || config.skeleton_only
+            || config.skeleton_gfa.is_some()
+            || config.skeleton_rescue_gfa.is_some()
+            || config.run_minimap2)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--read-subsets currently supports one-round anchor assembly only; use --rounds 1 without skeleton or minimap2 options",
         ));
     }
     Ok(())
@@ -664,6 +894,7 @@ impl Config {
             min_unitig_len: 0,
             min_tip_len: 0,
             min_link_support: 0,
+            min_link_ratio: 0.0,
             read_junction_links: false,
             bidirectional_links: false,
             junction_rescue_support: 0,
@@ -685,6 +916,9 @@ impl Config {
             skeleton_rescue_gfa: None,
             skeleton_rescue_link_support: 20,
             rounds: 0,
+            read_subsets: vec![ReadSubset::full()],
+            read_subsets_requested: false,
+            read_subset_percent: ReadSubset::full(),
             threads: 1,
             run_minimap2: false,
         };
@@ -822,6 +1056,27 @@ impl Config {
                         "--min-link-support",
                     )?;
                     overrides.min_link_support = true;
+                }
+                "--min-link-ratio" => {
+                    i += 1;
+                    config.min_link_ratio =
+                        parse_f64(take_arg(&args, i, "min link ratio")?, "--min-link-ratio")?;
+                }
+                value
+                    if value.starts_with("--read-subsets=") || value.starts_with("--subsets=") =>
+                {
+                    let (flag, subset_spec) = value
+                        .split_once('=')
+                        .expect("matched subset option with assignment");
+                    config.read_subsets = parse_percent_list(subset_spec, flag)?;
+                    config.read_subsets_requested = true;
+                }
+                "--read-subsets" | "--subsets" => {
+                    let flag = args[i].clone();
+                    i += 1;
+                    config.read_subsets =
+                        parse_percent_list(&take_arg(&args, i, "read subsets")?, &flag)?;
+                    config.read_subsets_requested = true;
                 }
                 "--read-junction-links" => {
                     config.read_junction_links = true;
@@ -1113,6 +1368,65 @@ fn parse_f64(value: String, flag: &str) -> Result<f64, String> {
         .map_err(|_| format!("invalid {flag}: {value}"))
 }
 
+fn parse_percent_list(value: &str, flag: &str) -> Result<Vec<ReadSubset>, String> {
+    let mut percents = Vec::new();
+    for raw_part in value.split(',') {
+        let part = raw_part.trim();
+        if part.is_empty() {
+            return Err(format!("invalid {flag} value: {value}"));
+        }
+        percents.push(parse_read_subset_percent(part, flag)?);
+    }
+    percents.sort_unstable();
+    percents.dedup();
+    if percents.is_empty() {
+        return Err(format!("{flag} requires at least one value"));
+    }
+    Ok(percents)
+}
+
+fn parse_read_subset_percent(value: &str, flag: &str) -> Result<ReadSubset, String> {
+    let (whole_part, decimal_part) = match value.split_once('.') {
+        Some((whole, decimal)) => (whole, Some(decimal)),
+        None => (value, None),
+    };
+    if whole_part.is_empty() || whole_part.starts_with('+') || whole_part.starts_with('-') {
+        return Err(format!("invalid {flag} value: {value}"));
+    }
+
+    let whole = whole_part
+        .parse::<u16>()
+        .map_err(|_| format!("invalid {flag} value: {value}"))?;
+    let decimal = match decimal_part {
+        Some(decimal) => parse_percent_decimal(decimal, flag, value)?,
+        None => 0,
+    };
+    let basis_points = whole
+        .checked_mul(100)
+        .and_then(|scaled| scaled.checked_add(decimal))
+        .ok_or_else(|| format!("{flag} value must be > 0 and <= 100: {value}"))?;
+    if basis_points == 0 || basis_points > READ_SUBSET_SCALE {
+        return Err(format!("{flag} value must be > 0 and <= 100: {value}"));
+    }
+    Ok(ReadSubset { basis_points })
+}
+
+fn parse_percent_decimal(decimal: &str, flag: &str, value: &str) -> Result<u16, String> {
+    if decimal.is_empty() || decimal.len() > 2 || !decimal.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "{flag} values support at most two decimal places: {value}"
+        ));
+    }
+    let parsed = decimal
+        .parse::<u16>()
+        .map_err(|_| format!("invalid {flag} value: {value}"))?;
+    Ok(if decimal.len() == 1 {
+        parsed * 10
+    } else {
+        parsed
+    })
+}
+
 fn parse_size(value: String) -> Result<u64, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1176,6 +1490,9 @@ fn print_advanced_usage() {
            --min-unitig-len INT\n\
            --min-tip-len INT\n\
            --min-link-support INT\n\
+           --min-link-ratio FLOAT\n\
+           --read-subsets, --subsets LIST\n\
+                                      fan out deterministic read subsets in one pass, e.g. 12.5,25,50,100\n\
            --read-junction-links\n\
            --bidirectional-links\n\
          \n\
@@ -1897,6 +2214,14 @@ struct UnitigEnd {
     orient: char,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GfaLinkCandidate {
+    left: UnitigEnd,
+    right: UnitigEnd,
+    support: u32,
+    source: &'static str,
+}
+
 fn compress_unitigs(
     config: &Config,
     assembly: &Assembly,
@@ -2483,51 +2808,25 @@ fn write_gfa(
         )?;
     }
 
+    let candidates = collect_gfa_link_candidates(config, state_starts, state_ends, link_support);
+    let (out_best, in_best) = gfa_link_best_support(&candidates);
     let mut seen_links = HashSet::new();
     let mut links = Vec::new();
-    for (state, end_ids) in state_ends {
-        if let Some(start_ids) = state_starts.get(state) {
-            for &left in end_ids {
-                for &right in start_ids {
-                    if left.unitig_id == right.unitig_id && left.orient == right.orient {
-                        continue;
-                    }
-                    let support = link_support.get(&(left, right)).copied().unwrap_or(0);
-                    if support < config.min_link_support {
-                        continue;
-                    }
-                    add_gfa_link(
-                        &mut links,
-                        &mut seen_links,
-                        left,
-                        right,
-                        support,
-                        "terminal",
-                        config.bidirectional_links,
-                    );
-                }
-            }
+    for candidate in candidates {
+        let local_out_best = out_best.get(&candidate.left).copied().unwrap_or(0);
+        let local_in_best = in_best.get(&candidate.right).copied().unwrap_or(0);
+        if !keep_gfa_link(config, candidate.support, local_out_best, local_in_best) {
+            continue;
         }
-    }
-
-    if config.read_junction_links {
-        for (&(left, right), &support) in link_support {
-            if left.unitig_id == right.unitig_id && left.orient == right.orient {
-                continue;
-            }
-            if support < config.min_link_support {
-                continue;
-            }
-            add_gfa_link(
-                &mut links,
-                &mut seen_links,
-                left,
-                right,
-                support,
-                "read",
-                config.bidirectional_links,
-            );
-        }
+        add_gfa_link(
+            &mut links,
+            &mut seen_links,
+            candidate.left,
+            candidate.right,
+            candidate.support,
+            candidate.source,
+            config.bidirectional_links,
+        );
     }
 
     links.sort_by_key(|(left, right, _support, source)| (*left, *right, *source));
@@ -2547,6 +2846,80 @@ fn write_gfa(
         }
     }
     Ok(())
+}
+
+fn collect_gfa_link_candidates(
+    config: &Config,
+    state_starts: &HashMap<usize, Vec<UnitigEnd>>,
+    state_ends: &HashMap<usize, Vec<UnitigEnd>>,
+    link_support: &HashMap<(UnitigEnd, UnitigEnd), u32>,
+) -> Vec<GfaLinkCandidate> {
+    let mut candidates = Vec::new();
+    for (state, end_ids) in state_ends {
+        if let Some(start_ids) = state_starts.get(state) {
+            for &left in end_ids {
+                for &right in start_ids {
+                    if left.unitig_id == right.unitig_id && left.orient == right.orient {
+                        continue;
+                    }
+                    candidates.push(GfaLinkCandidate {
+                        left,
+                        right,
+                        support: link_support.get(&(left, right)).copied().unwrap_or(0),
+                        source: "terminal",
+                    });
+                }
+            }
+        }
+    }
+
+    if config.read_junction_links {
+        for (&(left, right), &support) in link_support {
+            if left.unitig_id == right.unitig_id && left.orient == right.orient {
+                continue;
+            }
+            candidates.push(GfaLinkCandidate {
+                left,
+                right,
+                support,
+                source: "read",
+            });
+        }
+    }
+    candidates
+}
+
+fn gfa_link_best_support(
+    candidates: &[GfaLinkCandidate],
+) -> (HashMap<UnitigEnd, u32>, HashMap<UnitigEnd, u32>) {
+    let mut out_best: HashMap<UnitigEnd, u32> = HashMap::new();
+    let mut in_best: HashMap<UnitigEnd, u32> = HashMap::new();
+    for candidate in candidates {
+        out_best
+            .entry(candidate.left)
+            .and_modify(|best| *best = (*best).max(candidate.support))
+            .or_insert(candidate.support);
+        in_best
+            .entry(candidate.right)
+            .and_modify(|best| *best = (*best).max(candidate.support))
+            .or_insert(candidate.support);
+    }
+    (out_best, in_best)
+}
+
+fn keep_gfa_link(config: &Config, support: u32, out_best: u32, in_best: u32) -> bool {
+    if support < config.min_link_support {
+        return false;
+    }
+    if config.min_link_ratio <= 0.0 {
+        return true;
+    }
+    if support == 0 {
+        return false;
+    }
+    let out_ratio = support as f64 / out_best.max(1) as f64;
+    let in_ratio = support as f64 / in_best.max(1) as f64;
+    out_ratio.min(in_ratio) >= config.min_link_ratio
 }
 
 fn add_gfa_link(
@@ -2672,6 +3045,8 @@ fn write_report(
     writeln!(out, "min_unitig_len\t{}", config.min_unitig_len)?;
     writeln!(out, "min_tip_len\t{}", config.min_tip_len)?;
     writeln!(out, "min_link_support\t{}", config.min_link_support)?;
+    writeln!(out, "min_link_ratio\t{}", config.min_link_ratio)?;
+    writeln!(out, "read_subset_percent\t{}", config.read_subset_percent)?;
     writeln!(out, "read_junction_links\t{}", config.read_junction_links)?;
     writeln!(out, "bidirectional_links\t{}", config.bidirectional_links)?;
     writeln!(
@@ -3626,5 +4001,63 @@ mod tests {
             thin_anchor_hits(vec![2, 5, 13, 17, 28], 10),
             vec![2, 13, 28]
         );
+    }
+
+    #[test]
+    fn parses_percent_lists() {
+        assert_eq!(
+            parse_percent_list("50,12.5,25,12.50", "--subsets").unwrap(),
+            vec![
+                ReadSubset { basis_points: 1250 },
+                ReadSubset { basis_points: 2500 },
+                ReadSubset { basis_points: 5000 },
+            ]
+        );
+        assert!(parse_percent_list("0,50", "--read-subsets").is_err());
+        assert!(parse_percent_list("25,", "--read-subsets").is_err());
+        assert!(parse_percent_list("12.345", "--subsets").is_err());
+    }
+
+    #[test]
+    fn parses_subsets_alias_arg() {
+        let config = Config::from_args(
+            [
+                "simple_draft_asm",
+                "--organelle",
+                "plastid",
+                "-i",
+                "reads.fastq.gz",
+                "--subsets=12.5,25",
+            ]
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        )
+        .unwrap();
+
+        assert!(config.read_subsets_requested);
+        assert_eq!(
+            config.read_subsets,
+            vec![
+                ReadSubset { basis_points: 1250 },
+                ReadSubset { basis_points: 2500 },
+            ]
+        );
+    }
+
+    #[test]
+    fn read_subsets_are_nested() {
+        let subset_25 = ReadSubset { basis_points: 2500 };
+        let subset_50 = ReadSubset { basis_points: 5000 };
+        let subset_75 = ReadSubset { basis_points: 7500 };
+        for i in 0..1000 {
+            let name = format!("read-{i}");
+            if keep_read_for_subset(&name, i, subset_25) {
+                assert!(keep_read_for_subset(&name, i, subset_50));
+            }
+            if keep_read_for_subset(&name, i, subset_50) {
+                assert!(keep_read_for_subset(&name, i, subset_75));
+            }
+        }
     }
 }

@@ -37,6 +37,60 @@ Use `--rounds 1` if you want only the first mitochondrial skeleton pass. Use
 `--numt-interference low|high` to switch the mitochondrial profile; the mito
 default is currently `high`.
 
+## Link sensitivity
+
+For large plastid datasets, weak secondary links can be retained even when the
+dominant graph is already clear. Use `--min-link-ratio` to require each GFA link
+to have support close to the best competing link at both of its endpoints:
+
+```bash
+./target/release/simple_draft_asm --organelle plastid \
+  -i data/rice_plastid.fastq.gz \
+  -o result_rice_plastid_clean \
+  --min-link-ratio 0.30 \
+  -t 8
+```
+
+The default is `0`, which preserves the previous fixed `--min-link-support`
+behavior. A value such as `0.30` removes low-proportion secondary links while
+keeping the primary endpoint-supported links.
+
+For the current rice plastid dataset, use the cleaned 25% read subset as the
+working parameter combination:
+
+```bash
+./target/release/simple_draft_asm --organelle plastid \
+  -i data/rice_plastid.fastq.gz \
+  -o result_rice_plastid_best \
+  --min-link-ratio 0.30 \
+  --subsets=25 \
+  -t 8
+```
+
+## Read subsampling
+
+Use `--read-subsets` to run deterministic read-level subsampling experiments in
+one command. `--subsets` is the same option with a shorter name. Reads are
+selected before syncmer/minimizer discovery, and retained reads follow the
+normal assembly path. For formal data-volume checks, use a halving series:
+
+```bash
+./target/release/simple_draft_asm --organelle plastid \
+  -i data/rice_plastid.fastq.gz \
+  -o result_rice_plastid_read_subsets \
+  --subsets=12.5,25,50,100 \
+  -t 8
+```
+
+Each subset is written under the output directory as `read_subset_25/`,
+`read_subset_50/`, and so on. Decimal subsets use underscores in directory
+names, for example `read_subset_12_5/`. The top-level `read_subsets.tsv`
+records the elapsed time and read ID file for each subset. Non-100% subsets also
+write `read_ids.txt` in their subset directory for downstream read extraction;
+IDs are the first whitespace-delimited token in each FASTQ/FASTA header. The
+default behavior is unchanged when neither `--read-subsets` nor `--subsets` is
+supplied.
+
 ## Main outputs
 
 - `graph.gfa`: final draft graph.
