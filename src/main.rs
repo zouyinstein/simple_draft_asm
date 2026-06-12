@@ -336,6 +336,10 @@ fn run_single_config(config: &Config, started: Instant) -> io::Result<()> {
     run_anchor_assembly(config, started)
 }
 
+fn is_mito_compact(config: &Config) -> bool {
+    config.organelle == Some(OrganelleProfile::Mito) && config.data_mode == DataMode::Compact
+}
+
 fn run_read_subsets(config: Config) -> io::Result<()> {
     if read_subsets_need_materialized_reads(&config) {
         return run_materialized_read_subsets(config);
@@ -784,7 +788,11 @@ fn run_two_rounds(config: &Config, started: Instant) -> io::Result<()> {
     round2.skeleton_only = true;
     round2.skeleton_gfa = Some(round1_dir.join("graph.gfa"));
     round2.skeleton_rescue_gfa = Some(round1_readlinks_dir.join("graph.gfa"));
-    run_skeleton_linking(&round2)?;
+    if is_mito_compact(config) {
+        run_mito_compact_bridge_linking(&round2)?;
+    } else {
+        run_skeleton_linking(&round2)?;
+    }
 
     copy_final_two_round_outputs(config, &round1_dir, &round2_dir)?;
     write_two_round_report(
@@ -3410,6 +3418,74 @@ struct SkeletonLinkSupport {
     in_ratio: f64,
 }
 
+const MITO_COMPACT_LOCAL_BRIDGE_GAP_MULTIPLIER: usize = 20;
+const MITO_COMPACT_MAX_ENDPOINT_DEGREE: usize = 2;
+const MITO_COMPACT_SMALL_COMPONENT_MAX_SEGMENTS: usize = 3;
+const MITO_COMPACT_SMALL_COMPONENT_MAX_BASES: usize = 30_000;
+
+#[derive(Debug, Clone)]
+struct SkeletonGraphStats {
+    components: Vec<Vec<String>>,
+    component_by_segment: HashMap<String, usize>,
+    open_out: HashSet<(String, char)>,
+    open_in: HashSet<(String, char)>,
+    out_degree: HashMap<(String, char), usize>,
+    in_degree: HashMap<(String, char), usize>,
+    kept_links: usize,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum MitoCompactBridgeSource {
+    LocalPaf,
+    Rescue,
+}
+
+impl MitoCompactBridgeSource {
+    fn label(self) -> &'static str {
+        match self {
+            MitoCompactBridgeSource::LocalPaf => "local_paf",
+            MitoCompactBridgeSource::Rescue => "read_walk",
+        }
+    }
+
+    fn priority(self) -> usize {
+        match self {
+            MitoCompactBridgeSource::LocalPaf => 1,
+            MitoCompactBridgeSource::Rescue => 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MitoCompactBridgeCandidate {
+    key: SkeletonLinkKey,
+    support: u32,
+    source: MitoCompactBridgeSource,
+}
+
+#[derive(Debug, Clone)]
+struct MitoCompactSelectedBridge {
+    candidate: MitoCompactBridgeCandidate,
+    component_delta: usize,
+    open_delta: usize,
+}
+
+#[derive(Debug, Default)]
+struct MitoCompactBridgeReport {
+    initial_components: Vec<usize>,
+    initial_open_roles: usize,
+    initial_kept_links: usize,
+    focused_reads: usize,
+    local_candidates: usize,
+    rescue_candidates: usize,
+    selected: Vec<MitoCompactSelectedBridge>,
+    pruned_links: Vec<SkeletonLinkKey>,
+    pruned_segments: Vec<String>,
+    final_components: Vec<usize>,
+    final_open_roles: usize,
+    final_kept_links: usize,
+}
+
 fn run_skeleton_linking(config: &Config) -> io::Result<()> {
     let skeleton_gfa = config
         .skeleton_gfa
@@ -3451,6 +3527,78 @@ fn run_skeleton_linking(config: &Config) -> io::Result<()> {
         &merged_links,
     )?;
     write_skeleton_report(config, skeleton_gfa, &segments, &merged_links)?;
+    Ok(())
+}
+
+fn run_mito_compact_bridge_linking(config: &Config) -> io::Result<()> {
+    let skeleton_gfa = config
+        .skeleton_gfa
+        .as_ref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--skeleton-gfa is required"))?;
+    let (segments, skeleton_links) = read_skeleton_gfa(skeleton_gfa)?;
+    if segments.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} has no S records", skeleton_gfa.display()),
+        ));
+    }
+
+    fs::create_dir_all(&config.out_dir)?;
+    let skeleton_fasta = config.out_dir.join("skeleton.segments.fasta");
+    write_skeleton_fasta(&skeleton_fasta, &segments)?;
+
+    let paf_path = config.out_dir.join("reads_to_skeleton.paf");
+    let log_path = config.out_dir.join("reads_to_skeleton.minimap2.log");
+    run_minimap2_to_target(config, &skeleton_fasta, &paf_path, &log_path)?;
+
+    let (depth, paf_links) = summarize_skeleton_paf(config, &segments, &paf_path)?;
+    let paf_by_read = read_filtered_skeleton_paf_by_read(config, &segments, &paf_path)?;
+    let mut merged_links = merge_skeleton_links(config, skeleton_links, paf_links);
+    let rescue_links = match &config.skeleton_rescue_gfa {
+        Some(rescue_gfa) => read_gfa_links(rescue_gfa)?,
+        None => HashMap::new(),
+    };
+
+    let mut bridge_report = complete_mito_compact_links(
+        config,
+        &segments,
+        &mut merged_links,
+        rescue_links,
+        &paf_by_read,
+    )?;
+    refresh_skeleton_link_ratios(config, &mut merged_links);
+    let pruned_links = prune_mito_compact_secondary_links(config, &segments, &mut merged_links);
+    bridge_report.pruned_links = pruned_links;
+    refresh_skeleton_link_ratios(config, &mut merged_links);
+
+    let final_segment_names =
+        mito_compact_final_segment_names(config, &segments, &merged_links, &mut bridge_report);
+    let final_segments: Vec<SkeletonSegment> = segments
+        .iter()
+        .filter(|segment| final_segment_names.contains(&segment.name))
+        .cloned()
+        .collect();
+    let final_links = filter_skeleton_links_to_segments(&merged_links, &final_segment_names);
+    let final_stats = skeleton_graph_stats(config, &final_segments, &final_links);
+    bridge_report.final_components = final_stats.components.iter().map(Vec::len).collect();
+    bridge_report.final_open_roles = final_stats.open_out.len() + final_stats.open_in.len();
+    bridge_report.final_kept_links = final_stats.kept_links;
+
+    write_skeleton_depth(
+        &config.out_dir.join("skeleton.depth.tsv"),
+        &final_segments,
+        &depth,
+    )?;
+    write_skeleton_links(&config.out_dir.join("skeleton.links.tsv"), &final_links)?;
+    write_skeleton_linked_gfa(
+        config,
+        &config.out_dir.join("skeleton.linked.gfa"),
+        &final_segments,
+        &depth,
+        &final_links,
+    )?;
+    write_skeleton_report(config, skeleton_gfa, &final_segments, &final_links)?;
+    write_mito_compact_bridge_report(config, &bridge_report)?;
     Ok(())
 }
 
@@ -3589,6 +3737,651 @@ fn skeleton_components(
         }
     }
     component
+}
+
+fn read_filtered_skeleton_paf_by_read(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    paf_path: &Path,
+) -> io::Result<HashMap<String, Vec<PafAln>>> {
+    let lengths: HashSet<String> = segments
+        .iter()
+        .map(|segment| segment.name.clone())
+        .collect();
+    let mut by_read: HashMap<String, Vec<PafAln>> = HashMap::new();
+    let reader = BufReader::new(File::open(paf_path)?);
+    for line in reader.lines() {
+        let line = line?;
+        let Some(aln) = parse_paf_line(&line) else {
+            continue;
+        };
+        if aln.identity() < config.minimap_min_identity || aln.alen < config.minimap_min_align_len {
+            continue;
+        }
+        if !lengths.contains(&aln.tname) {
+            continue;
+        }
+        by_read.entry(aln.qname.clone()).or_default().push(aln);
+    }
+    Ok(by_read)
+}
+
+fn complete_mito_compact_links(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    rescue_links: HashMap<SkeletonLinkKey, u32>,
+    paf_by_read: &HashMap<String, Vec<PafAln>>,
+) -> io::Result<MitoCompactBridgeReport> {
+    let initial_stats = skeleton_graph_stats(config, segments, links);
+    let mut report = MitoCompactBridgeReport {
+        initial_components: initial_stats.components.iter().map(Vec::len).collect(),
+        initial_open_roles: initial_stats.open_out.len() + initial_stats.open_in.len(),
+        initial_kept_links: initial_stats.kept_links,
+        ..MitoCompactBridgeReport::default()
+    };
+
+    let focused_reads = mito_compact_focused_reads(&initial_stats, paf_by_read);
+    report.focused_reads = focused_reads.len();
+    write_mito_compact_focused_reads(config, &focused_reads)?;
+
+    let local_candidates =
+        mito_compact_local_paf_candidates(config, &initial_stats, paf_by_read, &focused_reads);
+    let rescue_candidates = mito_compact_rescue_candidates(&initial_stats, rescue_links);
+    report.local_candidates = local_candidates.len();
+    report.rescue_candidates = rescue_candidates.len();
+
+    let mut candidates = Vec::with_capacity(local_candidates.len() + rescue_candidates.len());
+    candidates.extend(local_candidates);
+    candidates.extend(rescue_candidates);
+
+    loop {
+        let before = skeleton_graph_stats(config, segments, links);
+        let mut best: Option<(usize, (usize, usize, usize, u32), SkeletonGraphStats)> = None;
+        for (index, candidate) in candidates.iter().enumerate() {
+            if candidate.support < mito_compact_candidate_min_support(config, candidate.source) {
+                continue;
+            }
+            if skeleton_link_is_kept(config, links, &candidate.key) {
+                continue;
+            }
+            let mut trial_links = links.clone();
+            insert_mito_compact_bridge(config, &mut trial_links, candidate);
+            refresh_skeleton_link_ratios(config, &mut trial_links);
+            let after = skeleton_graph_stats(config, segments, &trial_links);
+            let component_delta = before
+                .components
+                .len()
+                .saturating_sub(after.components.len());
+            let open_before = before.open_out.len() + before.open_in.len();
+            let open_after = after.open_out.len() + after.open_in.len();
+            let open_delta = open_before.saturating_sub(open_after);
+            if component_delta == 0 && open_delta == 0 {
+                continue;
+            }
+            if !mito_compact_candidate_degree_ok(&after, &candidate.key)
+                && component_delta == 0
+                && open_delta == 0
+            {
+                continue;
+            }
+            let score = (
+                component_delta,
+                open_delta,
+                candidate.source.priority(),
+                candidate.support,
+            );
+            if best
+                .as_ref()
+                .is_none_or(|(_, best_score, _)| score > *best_score)
+            {
+                best = Some((index, score, after));
+            }
+        }
+
+        let Some((index, score, _after)) = best else {
+            break;
+        };
+        let candidate = candidates.swap_remove(index);
+        insert_mito_compact_bridge(config, links, &candidate);
+        report.selected.push(MitoCompactSelectedBridge {
+            candidate,
+            component_delta: score.0,
+            open_delta: score.1,
+        });
+    }
+
+    Ok(report)
+}
+
+fn mito_compact_candidate_min_support(config: &Config, source: MitoCompactBridgeSource) -> u32 {
+    match source {
+        MitoCompactBridgeSource::LocalPaf => config.skeleton_min_link_support,
+        MitoCompactBridgeSource::Rescue => config.skeleton_rescue_link_support,
+    }
+}
+
+fn mito_compact_focused_reads(
+    stats: &SkeletonGraphStats,
+    paf_by_read: &HashMap<String, Vec<PafAln>>,
+) -> HashSet<String> {
+    let mut focus_segments: HashSet<String> = HashSet::new();
+    for (segment, _) in stats.open_out.iter().chain(stats.open_in.iter()) {
+        focus_segments.insert(segment.clone());
+    }
+    for component in stats.components.iter().skip(1) {
+        for segment in component {
+            focus_segments.insert(segment.clone());
+        }
+    }
+
+    let mut read_ids = HashSet::new();
+    for (read, alns) in paf_by_read {
+        if alns.iter().any(|aln| focus_segments.contains(&aln.tname)) {
+            read_ids.insert(read.clone());
+        }
+    }
+    read_ids
+}
+
+fn write_mito_compact_focused_reads(
+    config: &Config,
+    focused_reads: &HashSet<String>,
+) -> io::Result<()> {
+    let ids_path = config.out_dir.join("mito_compact_bridge.read_ids.txt");
+    let mut ids: Vec<_> = focused_reads.iter().collect();
+    ids.sort();
+    let mut id_out = File::create(ids_path)?;
+    for read in &ids {
+        writeln!(id_out, "{read}")?;
+    }
+
+    let fasta_path = config.out_dir.join("mito_compact_bridge.reads.fasta");
+    let mut fasta = BufWriter::new(File::create(fasta_path)?);
+    let mut read_index = 0u64;
+    for path in &config.reads {
+        read_sequence_file(path, |name, seq| {
+            if focused_reads.contains(name) {
+                write_fasta_record(&mut fasta, name, read_index, seq)?;
+            }
+            read_index += 1;
+            Ok(true)
+        })?;
+    }
+    fasta.flush()?;
+    Ok(())
+}
+
+fn mito_compact_local_paf_candidates(
+    config: &Config,
+    stats: &SkeletonGraphStats,
+    paf_by_read: &HashMap<String, Vec<PafAln>>,
+    focused_reads: &HashSet<String>,
+) -> Vec<MitoCompactBridgeCandidate> {
+    let local_gap = mito_compact_local_bridge_gap(config);
+    let mut support: HashMap<SkeletonLinkKey, u32> = HashMap::new();
+    for read in focused_reads {
+        let Some(alns) = paf_by_read.get(read) else {
+            continue;
+        };
+        let chain = paf_non_overlapping_chain(alns.clone(), local_gap);
+        let mut read_keys = HashSet::new();
+        for left_index in 0..chain.len() {
+            for right_index in left_index + 1..chain.len() {
+                let left = &chain[left_index];
+                let right = &chain[right_index];
+                let gap = right.qstart as isize - left.qend as isize;
+                if gap.abs() > local_gap {
+                    continue;
+                }
+                let Some(from_orient) = paf_exit_orient(left, config.skeleton_end_slop) else {
+                    continue;
+                };
+                let Some(to_orient) = paf_entry_orient(right, config.skeleton_end_slop) else {
+                    continue;
+                };
+                if left.tname == right.tname && from_orient == to_orient {
+                    continue;
+                }
+                let key = SkeletonLinkKey {
+                    from: left.tname.clone(),
+                    from_orient,
+                    to: right.tname.clone(),
+                    to_orient,
+                };
+                if mito_compact_candidate_is_relevant(stats, &key) {
+                    read_keys.insert(key);
+                }
+            }
+        }
+        for key in read_keys {
+            *support.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    support
+        .into_iter()
+        .map(|(key, support)| MitoCompactBridgeCandidate {
+            key,
+            support,
+            source: MitoCompactBridgeSource::LocalPaf,
+        })
+        .collect()
+}
+
+fn mito_compact_rescue_candidates(
+    stats: &SkeletonGraphStats,
+    rescue_links: HashMap<SkeletonLinkKey, u32>,
+) -> Vec<MitoCompactBridgeCandidate> {
+    rescue_links
+        .into_iter()
+        .filter(|(key, _)| mito_compact_candidate_is_relevant(stats, key))
+        .map(|(key, support)| MitoCompactBridgeCandidate {
+            key,
+            support,
+            source: MitoCompactBridgeSource::Rescue,
+        })
+        .collect()
+}
+
+fn mito_compact_local_bridge_gap(config: &Config) -> isize {
+    let local_gap = config
+        .skeleton_end_slop
+        .saturating_mul(MITO_COMPACT_LOCAL_BRIDGE_GAP_MULTIPLIER);
+    config.paf_max_link_gap.max(local_gap as isize)
+}
+
+fn mito_compact_candidate_is_relevant(stats: &SkeletonGraphStats, key: &SkeletonLinkKey) -> bool {
+    let from_component = stats.component_by_segment.get(&key.from);
+    let to_component = stats.component_by_segment.get(&key.to);
+    from_component
+        .zip(to_component)
+        .is_some_and(|(from, to)| from != to)
+        || stats
+            .open_out
+            .contains(&(key.from.clone(), key.from_orient))
+        || stats.open_in.contains(&(key.to.clone(), key.to_orient))
+}
+
+fn insert_mito_compact_bridge(
+    config: &Config,
+    links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    candidate: &MitoCompactBridgeCandidate,
+) {
+    insert_mito_compact_bridge_key(links, &candidate.key, candidate.source, candidate.support);
+    if config.bidirectional_links {
+        let rc = reverse_skeleton_link_key(&candidate.key);
+        insert_mito_compact_bridge_key(links, &rc, candidate.source, candidate.support);
+    }
+}
+
+fn insert_mito_compact_bridge_key(
+    links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    key: &SkeletonLinkKey,
+    source: MitoCompactBridgeSource,
+    support: u32,
+) {
+    let entry = links.entry(key.clone()).or_default();
+    match source {
+        MitoCompactBridgeSource::LocalPaf => {
+            entry.paf_support = entry.paf_support.max(support);
+        }
+        MitoCompactBridgeSource::Rescue => {
+            entry.rescue_support = entry.rescue_support.max(support);
+        }
+    }
+}
+
+fn mito_compact_candidate_degree_ok(stats: &SkeletonGraphStats, key: &SkeletonLinkKey) -> bool {
+    let rc = reverse_skeleton_link_key(key);
+    skeleton_out_degree(stats, &key.from, key.from_orient) <= MITO_COMPACT_MAX_ENDPOINT_DEGREE
+        && skeleton_in_degree(stats, &key.to, key.to_orient) <= MITO_COMPACT_MAX_ENDPOINT_DEGREE
+        && skeleton_out_degree(stats, &rc.from, rc.from_orient) <= MITO_COMPACT_MAX_ENDPOINT_DEGREE
+        && skeleton_in_degree(stats, &rc.to, rc.to_orient) <= MITO_COMPACT_MAX_ENDPOINT_DEGREE
+}
+
+fn skeleton_out_degree(stats: &SkeletonGraphStats, segment: &str, orient: char) -> usize {
+    stats
+        .out_degree
+        .get(&(segment.to_string(), orient))
+        .copied()
+        .unwrap_or(0)
+}
+
+fn skeleton_in_degree(stats: &SkeletonGraphStats, segment: &str, orient: char) -> usize {
+    stats
+        .in_degree
+        .get(&(segment.to_string(), orient))
+        .copied()
+        .unwrap_or(0)
+}
+
+fn skeleton_link_is_kept(
+    config: &Config,
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    key: &SkeletonLinkKey,
+) -> bool {
+    links
+        .get(key)
+        .is_some_and(|support| keep_skeleton_link(config, support))
+}
+
+fn skeleton_graph_stats(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> SkeletonGraphStats {
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    let mut out_degree: HashMap<(String, char), usize> = HashMap::new();
+    let mut in_degree: HashMap<(String, char), usize> = HashMap::new();
+    let mut kept_links = 0usize;
+
+    for segment in segments {
+        adj.entry(segment.name.clone()).or_default();
+    }
+    for (key, support) in links {
+        if !keep_skeleton_link(config, support) {
+            continue;
+        }
+        kept_links += 1;
+        adj.entry(key.from.clone())
+            .or_default()
+            .push(key.to.clone());
+        adj.entry(key.to.clone())
+            .or_default()
+            .push(key.from.clone());
+        *out_degree
+            .entry((key.from.clone(), key.from_orient))
+            .or_insert(0) += 1;
+        *in_degree
+            .entry((key.to.clone(), key.to_orient))
+            .or_insert(0) += 1;
+    }
+
+    let mut components = Vec::new();
+    let mut component_by_segment = HashMap::new();
+    let mut seen = HashSet::new();
+    for segment in segments {
+        if seen.contains(&segment.name) {
+            continue;
+        }
+        let component_id = components.len();
+        let mut component = Vec::new();
+        let mut stack = vec![segment.name.clone()];
+        seen.insert(segment.name.clone());
+        while let Some(node) = stack.pop() {
+            component_by_segment.insert(node.clone(), component_id);
+            component.push(node.clone());
+            if let Some(neighbors) = adj.get(&node) {
+                for neighbor in neighbors {
+                    if seen.insert(neighbor.clone()) {
+                        stack.push(neighbor.clone());
+                    }
+                }
+            }
+        }
+        components.push(component);
+    }
+
+    components.sort_by(|left, right| {
+        right
+            .len()
+            .cmp(&left.len())
+            .then_with(|| left.first().cmp(&right.first()))
+    });
+    component_by_segment.clear();
+    for (component_id, component) in components.iter().enumerate() {
+        for segment in component {
+            component_by_segment.insert(segment.clone(), component_id);
+        }
+    }
+
+    let mut open_out = HashSet::new();
+    let mut open_in = HashSet::new();
+    for segment in segments {
+        for orient in ['+', '-'] {
+            let endpoint = (segment.name.clone(), orient);
+            if out_degree.get(&endpoint).copied().unwrap_or(0) == 0 {
+                open_out.insert(endpoint.clone());
+            }
+            if in_degree.get(&endpoint).copied().unwrap_or(0) == 0 {
+                open_in.insert(endpoint);
+            }
+        }
+    }
+
+    SkeletonGraphStats {
+        components,
+        component_by_segment,
+        open_out,
+        open_in,
+        out_degree,
+        in_degree,
+        kept_links,
+    }
+}
+
+fn prune_mito_compact_secondary_links(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> Vec<SkeletonLinkKey> {
+    let mut pruned = Vec::new();
+    loop {
+        let before = skeleton_graph_stats(config, segments, links);
+        let before_largest = before.components.first().map_or(0, Vec::len);
+        let before_open = before.open_out.len() + before.open_in.len();
+        let overloaded = mito_compact_overloaded_endpoints(&before);
+        if overloaded.is_empty() {
+            break;
+        }
+
+        let mut candidates: Vec<_> = links
+            .iter()
+            .filter(|(key, support)| {
+                keep_skeleton_link(config, support)
+                    && support.skeleton_support == 0
+                    && (overloaded.contains(&(key.from.clone(), key.from_orient, true))
+                        || overloaded.contains(&(key.to.clone(), key.to_orient, false)))
+            })
+            .map(|(key, support)| {
+                let source_penalty = if support.rescue_support > 0 && support.paf_support == 0 {
+                    0
+                } else {
+                    1
+                };
+                let support_score = support
+                    .paf_support
+                    .max(support.rescue_support)
+                    .max(support.skeleton_support);
+                (key.clone(), source_penalty, support_score)
+            })
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        let mut removed = None;
+        for (key, _, _) in candidates {
+            let mut trial = links.clone();
+            remove_skeleton_link_pair(&mut trial, &key);
+            let after = skeleton_graph_stats(config, segments, &trial);
+            let after_largest = after.components.first().map_or(0, Vec::len);
+            let after_open = after.open_out.len() + after.open_in.len();
+            if after.components.len() <= before.components.len()
+                && after_largest >= before_largest
+                && after_open <= before_open
+            {
+                remove_skeleton_link_pair(links, &key);
+                removed = Some(key);
+                break;
+            }
+        }
+
+        let Some(key) = removed else {
+            break;
+        };
+        pruned.push(key);
+    }
+    pruned
+}
+
+fn mito_compact_overloaded_endpoints(stats: &SkeletonGraphStats) -> HashSet<(String, char, bool)> {
+    let mut overloaded = HashSet::new();
+    for ((segment, orient), degree) in &stats.out_degree {
+        if *degree > MITO_COMPACT_MAX_ENDPOINT_DEGREE {
+            overloaded.insert((segment.clone(), *orient, true));
+        }
+    }
+    for ((segment, orient), degree) in &stats.in_degree {
+        if *degree > MITO_COMPACT_MAX_ENDPOINT_DEGREE {
+            overloaded.insert((segment.clone(), *orient, false));
+        }
+    }
+    overloaded
+}
+
+fn remove_skeleton_link_pair(
+    links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    key: &SkeletonLinkKey,
+) {
+    links.remove(key);
+    let rc = reverse_skeleton_link_key(key);
+    links.remove(&rc);
+}
+
+fn mito_compact_final_segment_names(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    report: &mut MitoCompactBridgeReport,
+) -> HashSet<String> {
+    let stats = skeleton_graph_stats(config, segments, links);
+    let lengths: HashMap<String, usize> = segments
+        .iter()
+        .map(|segment| (segment.name.clone(), segment.sequence.len()))
+        .collect();
+    let mut keep = HashSet::new();
+    let Some(main_component) = stats.components.first() else {
+        return keep;
+    };
+    for segment in main_component {
+        keep.insert(segment.clone());
+    }
+
+    for component in stats.components.iter().skip(1) {
+        let bases: usize = component
+            .iter()
+            .map(|segment| lengths.get(segment).copied().unwrap_or(0))
+            .sum();
+        let is_small = component.len() <= MITO_COMPACT_SMALL_COMPONENT_MAX_SEGMENTS
+            || bases <= MITO_COMPACT_SMALL_COMPONENT_MAX_BASES;
+        if is_small {
+            report.pruned_segments.extend(component.iter().cloned());
+        } else {
+            keep.extend(component.iter().cloned());
+        }
+    }
+    report.pruned_segments.sort();
+    keep
+}
+
+fn filter_skeleton_links_to_segments(
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    segment_names: &HashSet<String>,
+) -> HashMap<SkeletonLinkKey, SkeletonLinkSupport> {
+    links
+        .iter()
+        .filter(|(key, _)| segment_names.contains(&key.from) && segment_names.contains(&key.to))
+        .map(|(key, support)| (key.clone(), support.clone()))
+        .collect()
+}
+
+fn write_mito_compact_bridge_report(
+    config: &Config,
+    report: &MitoCompactBridgeReport,
+) -> io::Result<()> {
+    let mut out = File::create(config.out_dir.join("mito_compact_bridge.report.txt"))?;
+    writeln!(out, "mito_compact_bridge_report")?;
+    writeln!(out, "mode\tlocal_open_end_bridge")?;
+    writeln!(
+        out,
+        "local_bridge_gap\t{}",
+        mito_compact_local_bridge_gap(config)
+    )?;
+    writeln!(out, "initial_kept_links\t{}", report.initial_kept_links)?;
+    writeln!(
+        out,
+        "initial_components\t{}",
+        join_usize_list(&report.initial_components)
+    )?;
+    writeln!(out, "initial_open_roles\t{}", report.initial_open_roles)?;
+    writeln!(out, "focused_reads\t{}", report.focused_reads)?;
+    writeln!(out, "local_candidates\t{}", report.local_candidates)?;
+    writeln!(out, "rescue_candidates\t{}", report.rescue_candidates)?;
+    writeln!(out, "selected_bridges\t{}", report.selected.len())?;
+    writeln!(out, "pruned_links\t{}", report.pruned_links.len())?;
+    writeln!(
+        out,
+        "pruned_segments\t{}",
+        join_string_list(&report.pruned_segments)
+    )?;
+    writeln!(out, "final_kept_links\t{}", report.final_kept_links)?;
+    writeln!(
+        out,
+        "final_components\t{}",
+        join_usize_list(&report.final_components)
+    )?;
+    writeln!(out, "final_open_roles\t{}", report.final_open_roles)?;
+
+    let mut bridge_out = File::create(config.out_dir.join("mito_compact_bridge.links.tsv"))?;
+    writeln!(
+        bridge_out,
+        "from\tfrom_orient\tto\tto_orient\tsource\tsupport\tcomponent_delta\topen_delta"
+    )?;
+    for selected in &report.selected {
+        let key = &selected.candidate.key;
+        writeln!(
+            bridge_out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            key.from,
+            key.from_orient,
+            key.to,
+            key.to_orient,
+            selected.candidate.source.label(),
+            selected.candidate.support,
+            selected.component_delta,
+            selected.open_delta
+        )?;
+    }
+
+    let mut pruned_out = File::create(config.out_dir.join("mito_compact_bridge.pruned.tsv"))?;
+    writeln!(pruned_out, "kind\tfrom\tfrom_orient\tto\tto_orient")?;
+    for key in &report.pruned_links {
+        writeln!(
+            pruned_out,
+            "link\t{}\t{}\t{}\t{}",
+            key.from, key.from_orient, key.to, key.to_orient
+        )?;
+    }
+    for segment in &report.pruned_segments {
+        writeln!(pruned_out, "segment\t{segment}\t.\t.\t.")?;
+    }
+    Ok(())
+}
+
+fn join_usize_list(values: &[usize]) -> String {
+    values
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn join_string_list(values: &[String]) -> String {
+    values.join(",")
 }
 
 fn write_skeleton_fasta(path: &Path, segments: &[SkeletonSegment]) -> io::Result<()> {
@@ -3754,6 +4547,15 @@ fn paf_entry_orient(aln: &PafAln, slop: usize) -> Option<char> {
     }
 }
 
+fn reverse_skeleton_link_key(key: &SkeletonLinkKey) -> SkeletonLinkKey {
+    SkeletonLinkKey {
+        from: key.to.clone(),
+        from_orient: flip_orient(key.to_orient),
+        to: key.from.clone(),
+        to_orient: flip_orient(key.from_orient),
+    }
+}
+
 fn merge_skeleton_links(
     config: &Config,
     mut links: HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
@@ -3762,10 +4564,18 @@ fn merge_skeleton_links(
     for (key, support) in paf_links {
         links.entry(key).or_default().paf_support += support;
     }
+    refresh_skeleton_link_ratios(config, &mut links);
+    add_bidirectional_skeleton_links(config, &mut links);
+    links
+}
 
+fn refresh_skeleton_link_ratios(
+    _config: &Config,
+    links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) {
     let mut out_max: HashMap<(String, char), u32> = HashMap::new();
     let mut in_max: HashMap<(String, char), u32> = HashMap::new();
-    for (key, support) in &links {
+    for (key, support) in links.iter() {
         if support.paf_support == 0 {
             continue;
         }
@@ -3778,7 +4588,7 @@ fn merge_skeleton_links(
             .and_modify(|max| *max = (*max).max(support.paf_support))
             .or_insert(support.paf_support);
     }
-    for (key, support) in &mut links {
+    for (key, support) in links.iter_mut() {
         let out_best = out_max
             .get(&(key.from.clone(), key.from_orient))
             .copied()
@@ -3790,16 +4600,16 @@ fn merge_skeleton_links(
         support.out_ratio = support.paf_support as f64 / out_best.max(1) as f64;
         support.in_ratio = support.paf_support as f64 / in_best.max(1) as f64;
     }
+}
 
+fn add_bidirectional_skeleton_links(
+    config: &Config,
+    links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) {
     if config.bidirectional_links {
         let mut extra = Vec::new();
-        for (key, support) in &links {
-            let rc = SkeletonLinkKey {
-                from: key.to.clone(),
-                from_orient: flip_orient(key.to_orient),
-                to: key.from.clone(),
-                to_orient: flip_orient(key.from_orient),
-            };
+        for (key, support) in links.iter() {
+            let rc = reverse_skeleton_link_key(key);
             if !links.contains_key(&rc) {
                 extra.push((rc, support.clone()));
             }
@@ -3808,7 +4618,6 @@ fn merge_skeleton_links(
             links.insert(key, support);
         }
     }
-    links
 }
 
 fn write_skeleton_depth(
@@ -4360,6 +5169,105 @@ mod tests {
         assert_eq!(config.skeleton_min_link_support, 2);
         assert_eq!(config.skeleton_min_link_ratio, 0.0);
         assert_eq!(config.skeleton_rescue_link_support, 2);
+    }
+
+    #[test]
+    fn mito_compact_detection_is_narrow() {
+        let mito_compact = Config::from_args(
+            [
+                "simple_draft_asm",
+                "--organelle",
+                "mito",
+                "--small-dataset",
+                "-i",
+                "reads.fasta.gz",
+            ]
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        )
+        .unwrap();
+        let mito_standard = Config::from_args(
+            [
+                "simple_draft_asm",
+                "--organelle",
+                "mito",
+                "-i",
+                "reads.fasta.gz",
+            ]
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        )
+        .unwrap();
+        let plastid_compact = Config::from_args(
+            [
+                "simple_draft_asm",
+                "--organelle",
+                "plastid",
+                "--small-dataset",
+                "-i",
+                "reads.fasta.gz",
+            ]
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        )
+        .unwrap();
+
+        assert!(is_mito_compact(&mito_compact));
+        assert!(!is_mito_compact(&mito_standard));
+        assert!(!is_mito_compact(&plastid_compact));
+    }
+
+    #[test]
+    fn skeleton_graph_stats_identifies_open_roles() {
+        let config = Config::from_args(
+            [
+                "simple_draft_asm",
+                "--organelle",
+                "mito",
+                "--small-dataset",
+                "-i",
+                "reads.fasta.gz",
+            ]
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        )
+        .unwrap();
+        let segments = vec![
+            SkeletonSegment {
+                name: "utg0".to_string(),
+                sequence: "AAAA".to_string(),
+            },
+            SkeletonSegment {
+                name: "utg1".to_string(),
+                sequence: "CCCC".to_string(),
+            },
+        ];
+        let mut links = HashMap::new();
+        links.insert(
+            SkeletonLinkKey {
+                from: "utg0".to_string(),
+                from_orient: '+',
+                to: "utg1".to_string(),
+                to_orient: '+',
+            },
+            SkeletonLinkSupport {
+                paf_support: 2,
+                ..SkeletonLinkSupport::default()
+            },
+        );
+
+        let stats = skeleton_graph_stats(&config, &segments, &links);
+        assert_eq!(stats.kept_links, 1);
+        assert_eq!(
+            stats.components.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert!(stats.open_out.contains(&("utg1".to_string(), '+')));
+        assert!(stats.open_in.contains(&("utg0".to_string(), '+')));
     }
 
     #[test]

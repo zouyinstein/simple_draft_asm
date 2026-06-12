@@ -64,6 +64,15 @@ For the corrected MECAT mitochondrial input:
   -t 8
 ```
 
+In mitochondrial compact mode only, the second round performs an additional
+local bridge-completion step after read remapping. It identifies open skeleton
+ends and small disconnected components, extracts reads touching just those
+local regions, tests candidate bridges, and keeps only links that improve the
+main topology without creating high-degree secondary branching. Unsupported
+small components are omitted from the final main graph rather than force-linked.
+This compact-mito completion path does not change plastid compact mode or the
+standard large-data mito/plastid profiles.
+
 ## Link sensitivity
 
 For large plastid datasets, weak secondary links can be retained even when the
@@ -151,9 +160,19 @@ For two-round mitochondrial runs:
 - top-level `graph.gfa`, `depth.tsv`, and `links.tsv` are copied from the final
   second-round result.
 
+For mitochondrial compact runs, `round2_skeleton/` also includes local bridge
+diagnostics:
+
+- `mito_compact_bridge.report.txt`: bridge completion summary.
+- `mito_compact_bridge.links.tsv`: accepted local bridge candidates.
+- `mito_compact_bridge.pruned.tsv`: secondary links and small components
+  removed from the final main topology.
+- `mito_compact_bridge.read_ids.txt` and `mito_compact_bridge.reads.fasta`:
+  reads selected for local bridge inspection.
+
 ## Current validation
 
-These were regenerated with the quick commands above:
+These were regenerated with the quick and compact commands above:
 
 | result | graph | S | L | bases | min | max |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -162,6 +181,19 @@ These were regenerated with the quick commands above:
 | `result_mito_profile_default/round1_skeleton` | `graph.gfa` | 19 | 40 | 376,128 | 741 | 61,105 |
 | `result_mito_profile_default/round1_readlinks` | `graph.gfa` | 19 | 64 | 376,128 | 741 | 61,105 |
 | `result_mito_profile_default/round2_skeleton` | `skeleton.linked.gfa` | 19 | 46 | 376,128 | 741 | 61,105 |
+| `result_mecat_plastid_compact` | `graph.gfa` | 3 | 8 | 115,020 | 13,345 | 81,135 |
+| `result_mecat_mito_compact` | `graph.gfa` | 15 | 34 | 314,441 | 2,072 | 41,260 |
+| `codex_mecat_mito_AT007_compact` | `graph.gfa` | 18 | 40 | 365,716 | 917 | 76,599 |
+| `codex_mecat_mito_AT008_compact` | `graph.gfa` | 17 | 38 | 363,552 | 699 | 62,428 |
+
+Compact mitochondrial topology note: the MECAT 601-read input does not contain
+validated bridge evidence for every small component/end. The compact-mito
+completion step produces a single main component with endpoint degree bounded at
+2, matching the large rice mitochondrial graph shape at the S/L topology level
+without requiring one-to-one segment correspondence. The Arabidopsis compact
+checks above close as single main components with no open endpoints; AT007 uses
+one focused local PAF bridge, while AT008 closes from skeleton plus full-read PAF
+evidence without an extra bridge.
 
 ## Benchmark
 
