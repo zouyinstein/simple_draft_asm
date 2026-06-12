@@ -57,6 +57,46 @@ impl DataMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PresetProfile {
+    MitoLow,
+    MitoStandard,
+    MitoHigh,
+    PlastidLow,
+    PlastidStandard,
+    PlastidHigh,
+}
+
+impl PresetProfile {
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "ml" | "mito_low" | "mito-low" | "mitochondria_low" | "mitochondria-low"
+            | "mitochondrion_low" | "mitochondrion-low" => Some(PresetProfile::MitoLow),
+            "ms"
+            | "mito_standard"
+            | "mito-standard"
+            | "mitochondria_standard"
+            | "mitochondria-standard"
+            | "mitochondrion_standard"
+            | "mitochondrion-standard" => Some(PresetProfile::MitoStandard),
+            "mh" | "mito_high" | "mito-high" | "mitochondria_high" | "mitochondria-high"
+            | "mitochondrion_high" | "mitochondrion-high" => Some(PresetProfile::MitoHigh),
+            "pl" | "plastid_low" | "plastid-low" | "chloroplast_low" | "chloroplast-low"
+            | "cp_low" | "cp-low" => Some(PresetProfile::PlastidLow),
+            "ps"
+            | "plastid_standard"
+            | "plastid-standard"
+            | "chloroplast_standard"
+            | "chloroplast-standard"
+            | "cp_standard"
+            | "cp-standard" => Some(PresetProfile::PlastidStandard),
+            "ph" | "plastid_high" | "plastid-high" | "chloroplast_high" | "chloroplast-high"
+            | "cp_high" | "cp-high" => Some(PresetProfile::PlastidHigh),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct OverrideFlags {
     k: bool,
@@ -1099,6 +1139,18 @@ impl Config {
         let mut i = 1;
         while i < args.len() {
             match args[i].as_str() {
+                value if value.starts_with("--preset=") || value.starts_with("-p=") => {
+                    let (flag, preset) = value
+                        .split_once('=')
+                        .expect("matched preset option with assignment");
+                    apply_preset_arg(&mut config, preset, flag)?;
+                }
+                "--preset" | "-p" => {
+                    let flag = args[i].clone();
+                    i += 1;
+                    let preset = take_arg(&args, i, "preset")?;
+                    apply_preset_arg(&mut config, &preset, &flag)?;
+                }
                 "-i" | "--reads" | "--pacbio-hifi" => {
                     i += 1;
                     config
@@ -1421,6 +1473,57 @@ impl Config {
     }
 }
 
+fn apply_preset_arg(config: &mut Config, value: &str, flag: &str) -> Result<(), String> {
+    let Some(preset) = PresetProfile::from_str(value) else {
+        return Err(format!("unknown {flag} value: {value}"));
+    };
+    apply_preset(config, preset);
+    Ok(())
+}
+
+fn apply_preset(config: &mut Config, preset: PresetProfile) {
+    match preset {
+        PresetProfile::MitoLow => {
+            config.organelle = Some(OrganelleProfile::Mito);
+            config.data_mode = DataMode::Compact;
+        }
+        PresetProfile::MitoStandard => {
+            config.organelle = Some(OrganelleProfile::Mito);
+            config.data_mode = DataMode::Standard;
+        }
+        PresetProfile::MitoHigh => {
+            config.organelle = Some(OrganelleProfile::Mito);
+            config.data_mode = DataMode::Standard;
+            apply_high_preset_defaults(config);
+        }
+        PresetProfile::PlastidLow => {
+            config.organelle = Some(OrganelleProfile::Plastid);
+            config.data_mode = DataMode::Compact;
+        }
+        PresetProfile::PlastidStandard => {
+            config.organelle = Some(OrganelleProfile::Plastid);
+            config.data_mode = DataMode::Standard;
+        }
+        PresetProfile::PlastidHigh => {
+            config.organelle = Some(OrganelleProfile::Plastid);
+            config.data_mode = DataMode::Standard;
+            apply_high_preset_defaults(config);
+        }
+    }
+}
+
+fn apply_high_preset_defaults(config: &mut Config) {
+    config.min_link_ratio = 0.30;
+    config.read_subsets = vec![
+        ReadSubset { basis_points: 2500 },
+        ReadSubset { basis_points: 5000 },
+        ReadSubset {
+            basis_points: READ_SUBSET_SCALE,
+        },
+    ];
+    config.read_subsets_requested = true;
+}
+
 fn apply_profiles(config: &mut Config, overrides: &OverrideFlags) {
     if !overrides.rounds && config.rounds == 0 {
         config.rounds = match config.organelle {
@@ -1718,6 +1821,8 @@ fn print_usage() {
         "Usage: simple_draft_asm --pacbio-hifi reads.fastq.gz -o result_graph [options]\n\
          \n\
          Common options:\n\
+           -p, --preset PRESET         ml/mito_low, ms/mito_standard, mh/mito_high;\n\
+                                      pl/plastid_low, ps/plastid_standard, ph/plastid_high\n\
            --organelle plastid|mito     plastid defaults to 1 round; mito defaults to 2 rounds\n\
            --data-mode standard|compact compact mode for small corrected-read datasets\n\
            --small-dataset              alias for --data-mode compact\n\
@@ -1729,12 +1834,14 @@ fn print_usage() {
            --help-advanced              show tuning and skeleton-linking options\n\
          \n\
          Profile defaults:\n\
-           plastid: k=251, s=21, coverage=100, clean 1-round graph\n\
-           mito:    k=251, s=21, coverage=18, high NUMT caution, terminal skeleton + endpoint-link round\n\
+           low:     user-facing preset name for compact corrected-read mode\n\
+           standard: organelle standard profile; plastid stays 1 round, mito stays 2 rounds\n\
+           high:    high-data mode: standard profile plus --min-link-ratio 0.30 --subsets=25,50,100\n\
          \n\
          Typical commands:\n\
-           simple_draft_asm --organelle plastid -i data/plastid.fastq.gz -o result_plastid\n\
-           simple_draft_asm --organelle mito -i data/mito.fastq.gz -o result_mito"
+           simple_draft_asm -p ps -i data/plastid.fastq.gz -o result_plastid\n\
+           simple_draft_asm -p ms -i data/mito.fastq.gz -o result_mito\n\
+           simple_draft_asm -p ml -i data/mecat_mito.fasta.gz -o result_mito_low"
     );
 }
 
@@ -5116,6 +5223,115 @@ mod tests {
                 ReadSubset { basis_points: 2500 },
             ]
         );
+    }
+
+    #[test]
+    fn preset_mito_low_maps_to_compact_mito() {
+        let config = Config::from_args(
+            ["simple_draft_asm", "-p", "ml", "-i", "reads.fasta.gz"]
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        )
+        .unwrap();
+
+        assert_eq!(config.organelle, Some(OrganelleProfile::Mito));
+        assert_eq!(config.data_mode, DataMode::Compact);
+        assert_eq!(config.rounds, 2);
+        assert_eq!(config.skeleton_min_link_support, 2);
+    }
+
+    #[test]
+    fn preset_high_defaults_to_ratio_and_subsets() {
+        let config = Config::from_args(
+            ["simple_draft_asm", "--preset=mh", "-i", "reads.fastq.gz"]
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        )
+        .unwrap();
+
+        assert_eq!(config.organelle, Some(OrganelleProfile::Mito));
+        assert_eq!(config.data_mode, DataMode::Standard);
+        assert_eq!(config.rounds, 2);
+        assert!((config.min_link_ratio - 0.30).abs() < f64::EPSILON);
+        assert!(config.read_subsets_requested);
+        assert_eq!(
+            config.read_subsets,
+            vec![
+                ReadSubset { basis_points: 2500 },
+                ReadSubset { basis_points: 5000 },
+                ReadSubset {
+                    basis_points: READ_SUBSET_SCALE
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn preset_plastid_aliases_keep_plastid_round_logic() {
+        let low = Config::from_args(
+            [
+                "simple_draft_asm",
+                "--preset",
+                "plastid_low",
+                "-i",
+                "reads.fasta.gz",
+            ]
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        )
+        .unwrap();
+        let standard = Config::from_args(
+            ["simple_draft_asm", "-p", "ps", "-i", "reads.fastq.gz"]
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        )
+        .unwrap();
+        let high = Config::from_args(
+            ["simple_draft_asm", "-p=ph", "-i", "reads.fastq.gz"]
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        )
+        .unwrap();
+
+        assert_eq!(low.organelle, Some(OrganelleProfile::Plastid));
+        assert_eq!(low.data_mode, DataMode::Compact);
+        assert_eq!(low.rounds, 1);
+        assert_eq!(standard.organelle, Some(OrganelleProfile::Plastid));
+        assert_eq!(standard.data_mode, DataMode::Standard);
+        assert_eq!(standard.rounds, 1);
+        assert_eq!(high.organelle, Some(OrganelleProfile::Plastid));
+        assert_eq!(high.data_mode, DataMode::Standard);
+        assert_eq!(high.rounds, 1);
+        assert!((high.min_link_ratio - 0.30).abs() < f64::EPSILON);
+        assert!(high.read_subsets_requested);
+    }
+
+    #[test]
+    fn explicit_subset_after_high_preset_overrides_default() {
+        let config = Config::from_args(
+            [
+                "simple_draft_asm",
+                "-p",
+                "mh",
+                "--subsets=25",
+                "--min-link-ratio",
+                "0.10",
+                "-i",
+                "reads.fastq.gz",
+            ]
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        )
+        .unwrap();
+
+        assert_eq!(config.read_subsets, vec![ReadSubset { basis_points: 2500 }]);
+        assert!((config.min_link_ratio - 0.10).abs() < f64::EPSILON);
     }
 
     #[test]
