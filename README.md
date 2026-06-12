@@ -37,6 +37,33 @@ Use `--rounds 1` if you want only the first mitochondrial skeleton pass. Use
 `--numt-interference low|high` to switch the mitochondrial profile; the mito
 default is currently `high`.
 
+## Compact Datasets
+
+Use `--data-mode compact` or its alias `--small-dataset` for small corrected-read
+inputs where standard high-depth profiles can drop low-support links before the
+graph is complete. This mode keeps the standard rice plastid logic unchanged and
+only applies when explicitly requested.
+
+For the corrected MECAT plastid input:
+
+```bash
+./target/release/simple_draft_asm --organelle plastid \
+  --small-dataset \
+  -i data/mecat_corrected_plastid.fasta.gz \
+  -o result_mecat_plastid_compact \
+  -t 8
+```
+
+For the corrected MECAT mitochondrial input:
+
+```bash
+./target/release/simple_draft_asm --organelle mito \
+  --small-dataset \
+  -i data/mecat_corrected_mito.fasta.gz \
+  -o result_mecat_mito_compact \
+  -t 8
+```
+
 ## Link sensitivity
 
 For large plastid datasets, weak secondary links can be retained even when the
@@ -67,6 +94,18 @@ working parameter combination:
   -t 8
 ```
 
+For the current rice mitochondrial dataset, use the same 25% read subset and
+relative link filtering with the default two-round mitochondrial workflow:
+
+```bash
+./target/release/simple_draft_asm --organelle mito \
+  -i data/rice_mito.fastq.gz \
+  -o result_rice_mito_best \
+  --min-link-ratio 0.30 \
+  --subsets=25 \
+  -t 8
+```
+
 ## Read subsampling
 
 Use `--read-subsets` to run deterministic read-level subsampling experiments in
@@ -90,6 +129,11 @@ write `read_ids.txt` in their subset directory for downstream read extraction;
 IDs are the first whitespace-delimited token in each FASTQ/FASTA header. The
 default behavior is unchanged when neither `--read-subsets` nor `--subsets` is
 supplied.
+
+For workflows that need to read the data again, such as the default two-round
+mitochondrial mode, non-100% subsets also materialize `reads.fasta` in the
+subset directory. Round 1, skeleton remapping, and rescue all use that same
+subset FASTA, so the subset is applied consistently across the full workflow.
 
 ## Main outputs
 

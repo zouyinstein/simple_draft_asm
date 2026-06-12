@@ -42,6 +42,21 @@ impl NumtInterference {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DataMode {
+    Standard,
+    Compact,
+}
+
+impl DataMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            DataMode::Standard => "standard",
+            DataMode::Compact => "compact",
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct OverrideFlags {
     k: bool,
@@ -55,9 +70,13 @@ struct OverrideFlags {
     containment_ratio: bool,
     min_tip_len: bool,
     min_link_support: bool,
+    min_link_ratio: bool,
     read_junction_links: bool,
     bidirectional_links: bool,
     rounds: bool,
+    skeleton_min_link_support: bool,
+    skeleton_min_link_ratio: bool,
+    skeleton_rescue_link_support: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +84,7 @@ struct Config {
     reads: Vec<PathBuf>,
     out_dir: PathBuf,
     organelle: Option<OrganelleProfile>,
+    data_mode: DataMode,
     numt_interference: NumtInterference,
     anchor_mode: AnchorMode,
     k: usize,
@@ -224,6 +244,10 @@ struct ReadSubsetRun {
     target_bases: Option<u64>,
     read_id_path: Option<PathBuf>,
     read_id_writer: Option<BufWriter<File>>,
+    subset_read_path: Option<PathBuf>,
+    subset_read_writer: Option<BufWriter<File>>,
+    selected_reads: usize,
+    selected_bases: u64,
     started: Instant,
 }
 
@@ -313,39 +337,24 @@ fn run_single_config(config: &Config, started: Instant) -> io::Result<()> {
 }
 
 fn run_read_subsets(config: Config) -> io::Result<()> {
+    if read_subsets_need_materialized_reads(&config) {
+        return run_materialized_read_subsets(config);
+    }
+    run_anchor_read_subsets(config)
+}
+
+fn read_subsets_need_materialized_reads(config: &Config) -> bool {
+    config.rounds >= 2
+        || config.skeleton_only
+        || config.skeleton_gfa.is_some()
+        || config.skeleton_rescue_gfa.is_some()
+        || config.run_minimap2
+}
+
+fn run_anchor_read_subsets(config: Config) -> io::Result<()> {
     fs::create_dir_all(&config.out_dir)?;
 
-    let mut runs: Vec<ReadSubsetRun> = Vec::new();
-    for subset in &config.read_subsets {
-        let mut subset_config = config.clone();
-        subset_config.out_dir = config
-            .out_dir
-            .join(format!("read_subset_{}", subset.dir_label()));
-        subset_config.read_subsets_requested = false;
-        subset_config.read_subsets = vec![*subset];
-        subset_config.read_subset_percent = *subset;
-
-        fs::create_dir_all(&subset_config.out_dir)?;
-        let read_id_path = if subset.is_full() {
-            None
-        } else {
-            Some(subset_config.out_dir.join("read_ids.txt"))
-        };
-        let read_id_writer = match &read_id_path {
-            Some(path) => Some(BufWriter::new(File::create(path)?)),
-            None => None,
-        };
-
-        runs.push(ReadSubsetRun {
-            percent: *subset,
-            target_bases: target_bases_for_config(&subset_config),
-            config: subset_config,
-            assembly: new_assembly(),
-            read_id_path,
-            read_id_writer,
-            started: Instant::now(),
-        });
-    }
+    let mut runs = new_read_subset_runs(&config, false)?;
 
     let mut reads_loaded = 0u64;
     'inputs: for path in &config.reads {
@@ -363,6 +372,8 @@ fn run_read_subsets(config: Config) -> io::Result<()> {
                         if let Some(writer) = run.read_id_writer.as_mut() {
                             writeln!(writer, "{name}")?;
                         }
+                        run.selected_reads += 1;
+                        run.selected_bases += seq.len() as u64;
                     }
                 }
             }
@@ -404,6 +415,179 @@ fn run_read_subsets(config: Config) -> io::Result<()> {
     Ok(())
 }
 
+fn run_materialized_read_subsets(config: Config) -> io::Result<()> {
+    fs::create_dir_all(&config.out_dir)?;
+    let mut runs = new_read_subset_runs(&config, true)?;
+
+    materialize_read_subsets(&config, &mut runs)?;
+    for run in &mut runs {
+        if let Some(writer) = run.read_id_writer.as_mut() {
+            writer.flush()?;
+        }
+        if let Some(writer) = run.subset_read_writer.as_mut() {
+            writer.flush()?;
+        }
+        run.read_id_writer = None;
+        run.subset_read_writer = None;
+    }
+
+    let mut summary = File::create(config.out_dir.join("read_subsets.tsv"))?;
+    writeln!(
+        summary,
+        "read_subset_percent\tout_dir\tread_ids_file\tsubset_reads_file\telapsed_seconds"
+    )?;
+
+    for run in &runs {
+        run_single_config(&run.config, run.started)?;
+        writeln!(
+            summary,
+            "{}\t{}\t{}\t{}\t{:.3}",
+            run.percent,
+            run.config.out_dir.display(),
+            run.read_id_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            run.subset_read_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            run.started.elapsed().as_secs_f64()
+        )?;
+    }
+
+    Ok(())
+}
+
+fn new_read_subset_runs(
+    config: &Config,
+    materialize_reads: bool,
+) -> io::Result<Vec<ReadSubsetRun>> {
+    let mut runs = Vec::new();
+    for subset in &config.read_subsets {
+        let mut subset_config = config.clone();
+        subset_config.out_dir = config
+            .out_dir
+            .join(format!("read_subset_{}", subset.dir_label()));
+        subset_config.read_subsets_requested = false;
+        subset_config.read_subsets = vec![*subset];
+        subset_config.read_subset_percent = *subset;
+
+        fs::create_dir_all(&subset_config.out_dir)?;
+        let read_id_path = if subset.is_full() {
+            None
+        } else {
+            Some(subset_config.out_dir.join("read_ids.txt"))
+        };
+        let read_id_writer = match &read_id_path {
+            Some(path) => Some(BufWriter::new(File::create(path)?)),
+            None => None,
+        };
+        let subset_read_path = if materialize_reads && !subset.is_full() {
+            Some(subset_config.out_dir.join("reads.fasta"))
+        } else {
+            None
+        };
+        let subset_read_writer = match &subset_read_path {
+            Some(path) => Some(BufWriter::new(File::create(path)?)),
+            None => None,
+        };
+        if let Some(path) = &subset_read_path {
+            subset_config.reads = vec![path.clone()];
+        }
+
+        runs.push(ReadSubsetRun {
+            percent: *subset,
+            target_bases: target_bases_for_config(&subset_config),
+            config: subset_config,
+            assembly: new_assembly(),
+            read_id_path,
+            read_id_writer,
+            subset_read_path,
+            subset_read_writer,
+            selected_reads: 0,
+            selected_bases: 0,
+            started: Instant::now(),
+        });
+    }
+    Ok(runs)
+}
+
+fn materialize_read_subsets(config: &Config, runs: &mut [ReadSubsetRun]) -> io::Result<()> {
+    let mut reads_loaded = 0u64;
+    'inputs: for path in &config.reads {
+        read_sequence_file(path, |name, seq| {
+            let read_index = reads_loaded;
+            reads_loaded += 1;
+
+            if seq.len() >= config.min_read_len {
+                let bucket = read_subset_bucket(name, read_index);
+                for run in runs.iter_mut() {
+                    if run.percent.includes_bucket(bucket)
+                        && !read_subset_selection_limit_reached(run)
+                    {
+                        if let Some(writer) = run.subset_read_writer.as_mut() {
+                            write_fasta_record(writer, name, read_index, seq)?;
+                        }
+                        if let Some(writer) = run.read_id_writer.as_mut() {
+                            writeln!(writer, "{}", read_output_name(name, read_index))?;
+                        }
+                        run.selected_reads += 1;
+                        run.selected_bases += seq.len() as u64;
+                    }
+                }
+            }
+
+            Ok(!all_materialized_read_subset_runs_finished(runs))
+        })?;
+
+        if all_materialized_read_subset_runs_finished(runs) {
+            break 'inputs;
+        }
+    }
+    Ok(())
+}
+
+fn read_subset_selection_limit_reached(run: &ReadSubsetRun) -> bool {
+    if let Some(max_reads) = run.config.max_reads {
+        if run.selected_reads >= max_reads {
+            return true;
+        }
+    }
+    if let Some(target) = run.target_bases {
+        if run.selected_bases >= target {
+            return true;
+        }
+    }
+    false
+}
+
+fn all_materialized_read_subset_runs_finished(runs: &[ReadSubsetRun]) -> bool {
+    runs.iter().all(read_subset_selection_limit_reached)
+}
+
+fn write_fasta_record<W: Write>(
+    writer: &mut W,
+    name: &str,
+    read_index: u64,
+    seq: &str,
+) -> io::Result<()> {
+    writeln!(writer, ">{}", read_output_name(name, read_index))?;
+    for chunk in seq.as_bytes().chunks(80) {
+        writer.write_all(chunk)?;
+        writer.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn read_output_name(name: &str, read_index: u64) -> String {
+    if name.is_empty() {
+        format!("read_{read_index}")
+    } else {
+        name.to_string()
+    }
+}
+
 fn run_anchor_assembly(config: &Config, started: Instant) -> io::Result<()> {
     let result = compute_anchor_assembly(config)?;
     write_anchor_assembly_outputs(config, &result, started)?;
@@ -423,15 +607,9 @@ fn compute_anchor_assembly(config: &Config) -> io::Result<AnchorAssemblyResult> 
     let mut assembly = new_assembly();
     let target_bases = target_bases_for_config(config);
 
-    let mut reads_loaded = 0u64;
     'inputs: for path in &config.reads {
         read_sequence_file(path, |name, seq| {
-            let read_index = reads_loaded;
-            reads_loaded += 1;
             if seq.len() < config.min_read_len {
-                return Ok(true);
-            }
-            if !keep_read_for_subset(name, read_index, config.read_subset_percent) {
                 return Ok(true);
             }
             if assembly_limit_reached(config, &assembly, target_bases) {
@@ -516,10 +694,6 @@ fn finish_anchor_assembly(config: &Config, assembly: Assembly) -> AnchorAssembly
         full_junctions,
         full_link_support,
     }
-}
-
-fn keep_read_for_subset(name: &str, read_index: u64, percent: ReadSubset) -> bool {
-    percent.includes_bucket(read_subset_bucket(name, read_index))
 }
 
 fn read_subset_bucket(name: &str, read_index: u64) -> u16 {
@@ -692,6 +866,7 @@ fn write_two_round_report(
             .map(|o| o.as_str())
             .unwrap_or("unspecified")
     )?;
+    writeln!(out, "data_mode\t{}", config.data_mode.as_str())?;
     writeln!(out, "rounds\t{}", config.rounds)?;
     writeln!(out, "round1_skeleton\t{}", round1_dir.display())?;
     writeln!(out, "round1_readlinks\t{}", round1_readlinks_dir.display())?;
@@ -857,18 +1032,6 @@ fn validate_config(config: &Config) -> io::Result<()> {
             "internal read subset percent must be between 1 and 100",
         ));
     }
-    if config.read_subsets_requested
-        && (config.rounds >= 2
-            || config.skeleton_only
-            || config.skeleton_gfa.is_some()
-            || config.skeleton_rescue_gfa.is_some()
-            || config.run_minimap2)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--read-subsets currently supports one-round anchor assembly only; use --rounds 1 without skeleton or minimap2 options",
-        ));
-    }
     Ok(())
 }
 
@@ -878,6 +1041,7 @@ impl Config {
             reads: Vec::new(),
             out_dir: PathBuf::from("result_graph"),
             organelle: None,
+            data_mode: DataMode::Standard,
             numt_interference: NumtInterference::Low,
             anchor_mode: AnchorMode::Syncmer,
             k: 501,
@@ -944,6 +1108,17 @@ impl Config {
                         "mito" | "mitochondria" | "mitochondrion" | "mt" => OrganelleProfile::Mito,
                         other => return Err(format!("unknown --organelle value: {other}")),
                     });
+                }
+                "--data-mode" => {
+                    i += 1;
+                    config.data_mode = match take_arg(&args, i, "data mode")?.as_str() {
+                        "standard" | "default" => DataMode::Standard,
+                        "compact" | "small" | "small-dataset" => DataMode::Compact,
+                        other => return Err(format!("unknown --data-mode value: {other}")),
+                    };
+                }
+                "--small-dataset" => {
+                    config.data_mode = DataMode::Compact;
                 }
                 "--numt-interference" => {
                     i += 1;
@@ -1061,6 +1236,7 @@ impl Config {
                     i += 1;
                     config.min_link_ratio =
                         parse_f64(take_arg(&args, i, "min link ratio")?, "--min-link-ratio")?;
+                    overrides.min_link_ratio = true;
                 }
                 value
                     if value.starts_with("--read-subsets=") || value.starts_with("--subsets=") =>
@@ -1181,6 +1357,7 @@ impl Config {
                         take_arg(&args, i, "skeleton minimum link support")?,
                         "--skeleton-min-link-support",
                     )?;
+                    overrides.skeleton_min_link_support = true;
                 }
                 "--skeleton-min-link-ratio" => {
                     i += 1;
@@ -1188,6 +1365,7 @@ impl Config {
                         take_arg(&args, i, "skeleton minimum link ratio")?,
                         "--skeleton-min-link-ratio",
                     )?;
+                    overrides.skeleton_min_link_ratio = true;
                 }
                 "--skeleton-rescue-gfa" => {
                     i += 1;
@@ -1200,6 +1378,7 @@ impl Config {
                         take_arg(&args, i, "skeleton rescue link support")?,
                         "--skeleton-rescue-link-support",
                     )?;
+                    overrides.skeleton_rescue_link_support = true;
                 }
                 "--rounds" => {
                     i += 1;
@@ -1243,6 +1422,11 @@ fn apply_profiles(config: &mut Config, overrides: &OverrideFlags) {
     }
     if config.organelle == Some(OrganelleProfile::Mito) && !overrides.numt_interference {
         config.numt_interference = NumtInterference::High;
+    }
+
+    if config.data_mode == DataMode::Compact {
+        apply_compact_profile(config, overrides);
+        return;
     }
 
     match (config.organelle, config.numt_interference) {
@@ -1326,6 +1510,83 @@ fn apply_profiles(config: &mut Config, overrides: &OverrideFlags) {
                 config.rounds = 1;
             }
         }
+    }
+}
+
+fn apply_compact_profile(config: &mut Config, overrides: &OverrideFlags) {
+    apply_common_organelle_defaults(config, overrides);
+    match config.organelle {
+        Some(OrganelleProfile::Mito) => apply_compact_mito_profile(config, overrides),
+        Some(OrganelleProfile::Plastid) | None => apply_compact_plastid_profile(config, overrides),
+    }
+}
+
+fn apply_compact_plastid_profile(config: &mut Config, overrides: &OverrideFlags) {
+    if !overrides.min_anchor_coverage {
+        config.min_anchor_coverage = 3;
+    }
+    if !overrides.min_edge_coverage {
+        config.min_edge_coverage = 3;
+    }
+    if !overrides.min_branch_ratio && config.min_branch_ratio == 0.0 {
+        config.min_branch_ratio = 0.15;
+    }
+    if !overrides.max_edges_per_state && config.max_edges_per_state == 0 {
+        config.max_edges_per_state = 6;
+    }
+    if !overrides.min_tip_len {
+        config.min_tip_len = 0;
+    }
+    if !overrides.min_link_support {
+        config.min_link_support = 5;
+    }
+    if !overrides.min_link_ratio {
+        config.min_link_ratio = 0.0;
+    }
+    if !overrides.read_junction_links {
+        config.read_junction_links = true;
+    }
+    if !overrides.bidirectional_links {
+        config.bidirectional_links = true;
+    }
+}
+
+fn apply_compact_mito_profile(config: &mut Config, overrides: &OverrideFlags) {
+    if !overrides.min_anchor_coverage {
+        config.min_anchor_coverage = 10;
+    }
+    if !overrides.min_edge_coverage {
+        config.min_edge_coverage = 10;
+    }
+    if !overrides.min_branch_ratio && config.min_branch_ratio == 0.0 {
+        config.min_branch_ratio = 0.20;
+    }
+    if !overrides.max_edges_per_state && config.max_edges_per_state == 0 {
+        config.max_edges_per_state = 4;
+    }
+    if !overrides.min_tip_len {
+        config.min_tip_len = 1000;
+    }
+    if !overrides.min_link_support {
+        config.min_link_support = 2;
+    }
+    if !overrides.min_link_ratio {
+        config.min_link_ratio = 0.0;
+    }
+    if !overrides.read_junction_links {
+        config.read_junction_links = true;
+    }
+    if !overrides.bidirectional_links {
+        config.bidirectional_links = true;
+    }
+    if !overrides.skeleton_min_link_support {
+        config.skeleton_min_link_support = 2;
+    }
+    if !overrides.skeleton_min_link_ratio {
+        config.skeleton_min_link_ratio = 0.0;
+    }
+    if !overrides.skeleton_rescue_link_support {
+        config.skeleton_rescue_link_support = 2;
     }
 }
 
@@ -1450,6 +1711,8 @@ fn print_usage() {
          \n\
          Common options:\n\
            --organelle plastid|mito     plastid defaults to 1 round; mito defaults to 2 rounds\n\
+           --data-mode standard|compact compact mode for small corrected-read datasets\n\
+           --small-dataset              alias for --data-mode compact\n\
            --rounds INT                 override profile rounds\n\
            --numt-interference low|high mito profile strictness, mito default: high\n\
            -i, --pacbio-hifi FILE       input reads; may be repeated\n\
@@ -3021,6 +3284,7 @@ fn write_report(
         "numt_interference\t{}",
         config.numt_interference.as_str()
     )?;
+    writeln!(out, "data_mode\t{}", config.data_mode.as_str())?;
     writeln!(out, "rounds\t{}", config.rounds)?;
     writeln!(out, "anchor_mode\t{:?}", config.anchor_mode)?;
     writeln!(out, "k\t{}", config.k)?;
@@ -4046,17 +4310,71 @@ mod tests {
     }
 
     #[test]
+    fn compact_plastid_profile_uses_low_coverage_defaults() {
+        let config = Config::from_args(
+            [
+                "simple_draft_asm",
+                "--organelle",
+                "plastid",
+                "--small-dataset",
+                "-i",
+                "reads.fasta.gz",
+            ]
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        )
+        .unwrap();
+
+        assert_eq!(config.data_mode, DataMode::Compact);
+        assert_eq!(config.rounds, 1);
+        assert_eq!(config.min_anchor_coverage, 3);
+        assert_eq!(config.min_edge_coverage, 3);
+        assert_eq!(config.min_link_support, 5);
+        assert!(config.read_junction_links);
+    }
+
+    #[test]
+    fn compact_mito_profile_uses_rescue_friendly_defaults() {
+        let config = Config::from_args(
+            [
+                "simple_draft_asm",
+                "--organelle",
+                "mito",
+                "--data-mode",
+                "compact",
+                "-i",
+                "reads.fasta.gz",
+            ]
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        )
+        .unwrap();
+
+        assert_eq!(config.data_mode, DataMode::Compact);
+        assert_eq!(config.rounds, 2);
+        assert_eq!(config.min_anchor_coverage, 10);
+        assert_eq!(config.min_edge_coverage, 10);
+        assert_eq!(config.min_link_support, 2);
+        assert_eq!(config.skeleton_min_link_support, 2);
+        assert_eq!(config.skeleton_min_link_ratio, 0.0);
+        assert_eq!(config.skeleton_rescue_link_support, 2);
+    }
+
+    #[test]
     fn read_subsets_are_nested() {
         let subset_25 = ReadSubset { basis_points: 2500 };
         let subset_50 = ReadSubset { basis_points: 5000 };
         let subset_75 = ReadSubset { basis_points: 7500 };
         for i in 0..1000 {
             let name = format!("read-{i}");
-            if keep_read_for_subset(&name, i, subset_25) {
-                assert!(keep_read_for_subset(&name, i, subset_50));
+            let bucket = read_subset_bucket(&name, i);
+            if subset_25.includes_bucket(bucket) {
+                assert!(subset_50.includes_bucket(bucket));
             }
-            if keep_read_for_subset(&name, i, subset_50) {
-                assert!(keep_read_for_subset(&name, i, subset_75));
+            if subset_50.includes_bucket(bucket) {
+                assert!(subset_75.includes_bucket(bucket));
             }
         }
     }
