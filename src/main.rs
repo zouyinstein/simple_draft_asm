@@ -62,6 +62,7 @@ enum PresetProfile {
     MitoLow,
     MitoStandard,
     MitoHigh,
+    MitoStable,
     PlastidLow,
     PlastidStandard,
     PlastidHigh,
@@ -81,6 +82,15 @@ impl PresetProfile {
             | "mitochondrion-standard" => Some(PresetProfile::MitoStandard),
             "mh" | "mito_high" | "mito-high" | "mitochondria_high" | "mitochondria-high"
             | "mitochondrion_high" | "mitochondrion-high" => Some(PresetProfile::MitoHigh),
+            "mx"
+            | "mito_stable"
+            | "mito-stable"
+            | "mito_complex"
+            | "mito-complex"
+            | "mitochondria_stable"
+            | "mitochondria-stable"
+            | "mitochondrion_stable"
+            | "mitochondrion-stable" => Some(PresetProfile::MitoStable),
             "pl" | "plastid_low" | "plastid-low" | "chloroplast_low" | "chloroplast-low"
             | "cp_low" | "cp-low" => Some(PresetProfile::PlastidLow),
             "ps"
@@ -93,6 +103,36 @@ impl PresetProfile {
             "ph" | "plastid_high" | "plastid-high" | "chloroplast_high" | "chloroplast-high"
             | "cp_high" | "cp-high" => Some(PresetProfile::PlastidHigh),
             _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum MitoStableSelectionMode {
+    Auto,
+    ForbidSelected,
+    AllowSelected,
+}
+
+impl MitoStableSelectionMode {
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(MitoStableSelectionMode::Auto),
+            "forbid-selected" | "forbid_selected" | "forbid" => {
+                Some(MitoStableSelectionMode::ForbidSelected)
+            }
+            "allow-selected" | "allow_selected" | "allow" => {
+                Some(MitoStableSelectionMode::AllowSelected)
+            }
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            MitoStableSelectionMode::Auto => "auto",
+            MitoStableSelectionMode::ForbidSelected => "forbid-selected",
+            MitoStableSelectionMode::AllowSelected => "allow-selected",
         }
     }
 }
@@ -168,6 +208,13 @@ struct Config {
     read_subset_percent: ReadSubset,
     threads: usize,
     run_minimap2: bool,
+    mito_stable: bool,
+    mito_stable_selection_mode: MitoStableSelectionMode,
+    mito_stable_selected_nodes: HashSet<String>,
+    mito_stable_allow_three_way: HashSet<String>,
+    mito_stable_forbid_three_way: HashSet<String>,
+    mito_stable_force_links: Vec<SkeletonLinkKey>,
+    mito_stable_drop_links: Vec<SkeletonLinkKey>,
 }
 
 const READ_SUBSET_SCALE: u16 = 10_000;
@@ -363,7 +410,15 @@ fn run(config: Config, started: Instant) -> io::Result<()> {
 }
 
 fn run_single_config(config: &Config, started: Instant) -> io::Result<()> {
+    if config.mito_stable && config.skeleton_gfa.is_some() {
+        run_mito_stable_linking(config)?;
+        return Ok(());
+    }
     if config.skeleton_only {
+        if config.mito_stable {
+            run_mito_stable_linking(config)?;
+            return Ok(());
+        }
         run_skeleton_linking(config)?;
         return Ok(());
     }
@@ -828,7 +883,9 @@ fn run_two_rounds(config: &Config, started: Instant) -> io::Result<()> {
     round2.skeleton_only = true;
     round2.skeleton_gfa = Some(round1_dir.join("graph.gfa"));
     round2.skeleton_rescue_gfa = Some(round1_readlinks_dir.join("graph.gfa"));
-    if is_mito_compact(config) {
+    if config.mito_stable {
+        run_mito_stable_linking(&round2)?;
+    } else if is_mito_compact(config) {
         run_mito_compact_bridge_linking(&round2)?;
     } else {
         run_skeleton_linking(&round2)?;
@@ -869,6 +926,54 @@ fn copy_final_two_round_outputs(
     copy_if_exists(
         round2_dir.join("reads_to_skeleton.paf"),
         config.out_dir.join("reads_to_skeleton.paf"),
+    )?;
+    copy_if_exists(
+        round2_dir.join("mito_stable_bridge.report.txt"),
+        config.out_dir.join("mito_stable_bridge.report.txt"),
+    )?;
+    copy_if_exists(
+        round2_dir.join("mito_stable_bridge.candidates.tsv"),
+        config.out_dir.join("mito_stable_bridge.candidates.tsv"),
+    )?;
+    copy_if_exists(
+        round2_dir.join("mito_stable_bridge.selected.tsv"),
+        config.out_dir.join("mito_stable_bridge.selected.tsv"),
+    )?;
+    copy_if_exists(
+        round2_dir.join("mito_stable_repeat_expansions.tsv"),
+        config.out_dir.join("mito_stable_repeat_expansions.tsv"),
+    )?;
+    copy_if_exists(
+        round2_dir.join("mito_stable_pruned.tsv"),
+        config.out_dir.join("mito_stable_pruned.tsv"),
+    )?;
+    copy_if_exists(
+        round2_dir.join("mito_stable_node_degrees.tsv"),
+        config.out_dir.join("mito_stable_node_degrees.tsv"),
+    )?;
+    copy_if_exists(
+        round2_dir.join("mito_stable_topology_scan.tsv"),
+        config.out_dir.join("mito_stable_topology_scan.tsv"),
+    )?;
+    copy_if_exists(
+        round2_dir.join("mito_stable_splits.tsv"),
+        config.out_dir.join("mito_stable_splits.tsv"),
+    )?;
+    copy_if_exists(
+        round2_dir.join("mito_stable_manual_edits.tsv"),
+        config.out_dir.join("mito_stable_manual_edits.tsv"),
+    )?;
+    copy_if_exists(
+        round2_dir.join("mito_stable_node_repairs.tsv"),
+        config.out_dir.join("mito_stable_node_repairs.tsv"),
+    )?;
+    copy_if_exists(
+        round2_dir.join("mito_stable_copy_choice.tsv"),
+        config.out_dir.join("mito_stable_copy_choice.tsv"),
+    )?;
+    copy_if_exists(
+        round2_dir.join("mito_stable_selected_nodes.tsv"),
+        config.out_dir.join("mito_stable_selected_nodes.tsv"),
     )?;
     copy_if_exists(
         round1_dir.join("unitigs.fasta"),
@@ -915,6 +1020,7 @@ fn write_two_round_report(
             .unwrap_or("unspecified")
     )?;
     writeln!(out, "data_mode\t{}", config.data_mode.as_str())?;
+    writeln!(out, "mito_stable\t{}", config.mito_stable)?;
     writeln!(out, "rounds\t{}", config.rounds)?;
     writeln!(out, "round1_skeleton\t{}", round1_dir.display())?;
     writeln!(out, "round1_readlinks\t{}", round1_readlinks_dir.display())?;
@@ -1133,6 +1239,13 @@ impl Config {
             read_subset_percent: ReadSubset::full(),
             threads: 1,
             run_minimap2: false,
+            mito_stable: false,
+            mito_stable_selection_mode: MitoStableSelectionMode::Auto,
+            mito_stable_selected_nodes: HashSet::new(),
+            mito_stable_allow_three_way: HashSet::new(),
+            mito_stable_forbid_three_way: HashSet::new(),
+            mito_stable_force_links: Vec::new(),
+            mito_stable_drop_links: Vec::new(),
         };
 
         let mut overrides = OverrideFlags::default();
@@ -1307,12 +1420,121 @@ impl Config {
                     config.read_subsets = parse_percent_list(subset_spec, flag)?;
                     config.read_subsets_requested = true;
                 }
+                value
+                    if value.starts_with("--mx-mode=")
+                        || value.starts_with("--mito-stable-mode=") =>
+                {
+                    let (flag, mode) = value
+                        .split_once('=')
+                        .expect("matched mx-mode option with assignment");
+                    config.mito_stable_selection_mode =
+                        parse_mito_stable_selection_mode(mode, flag)?;
+                }
+                value
+                    if value.starts_with("--selected-nodes=")
+                        || value.starts_with("--mx-selected=")
+                        || value.starts_with("--mito-stable-selected=") =>
+                {
+                    let (flag, names) = value
+                        .split_once('=')
+                        .expect("matched selected-nodes option with assignment");
+                    config.mito_stable_selected_nodes = parse_name_set(names, flag)?;
+                }
+                value
+                    if value.starts_with("--mito-stable-allow-three-way=")
+                        || value.starts_with("--allow-three-way=") =>
+                {
+                    let (flag, names) = value
+                        .split_once('=')
+                        .expect("matched allow-three-way option with assignment");
+                    let selected = parse_name_set(names, flag)?;
+                    config.mito_stable_selection_mode = MitoStableSelectionMode::AllowSelected;
+                    config.mito_stable_selected_nodes = selected.clone();
+                    config.mito_stable_allow_three_way = selected;
+                    config.mito_stable_forbid_three_way.clear();
+                }
+                value
+                    if value.starts_with("--mito-stable-forbid-three-way=")
+                        || value.starts_with("--forbid-three-way=") =>
+                {
+                    let (flag, names) = value
+                        .split_once('=')
+                        .expect("matched forbid-three-way option with assignment");
+                    let selected = parse_name_set(names, flag)?;
+                    config.mito_stable_selection_mode = MitoStableSelectionMode::ForbidSelected;
+                    config.mito_stable_selected_nodes = selected.clone();
+                    config.mito_stable_forbid_three_way = selected;
+                    config.mito_stable_allow_three_way.clear();
+                }
+                value
+                    if value.starts_with("--mito-stable-force-link=")
+                        || value.starts_with("--force-link=") =>
+                {
+                    let (flag, links) = value
+                        .split_once('=')
+                        .expect("matched force-link option with assignment");
+                    config.mito_stable_force_links = parse_skeleton_link_key_list(links, flag)?;
+                }
+                value
+                    if value.starts_with("--mito-stable-drop-link=")
+                        || value.starts_with("--drop-link=") =>
+                {
+                    let (flag, links) = value
+                        .split_once('=')
+                        .expect("matched drop-link option with assignment");
+                    config.mito_stable_drop_links = parse_skeleton_link_key_list(links, flag)?;
+                }
                 "--read-subsets" | "--subsets" => {
                     let flag = args[i].clone();
                     i += 1;
                     config.read_subsets =
                         parse_percent_list(&take_arg(&args, i, "read subsets")?, &flag)?;
                     config.read_subsets_requested = true;
+                }
+                "--mx-mode" | "--mito-stable-mode" => {
+                    let flag = args[i].clone();
+                    i += 1;
+                    let mode = take_arg(&args, i, "mx mode")?;
+                    config.mito_stable_selection_mode =
+                        parse_mito_stable_selection_mode(&mode, &flag)?;
+                }
+                "--selected-nodes" | "--mx-selected" | "--mito-stable-selected" => {
+                    let flag = args[i].clone();
+                    i += 1;
+                    config.mito_stable_selected_nodes =
+                        parse_name_set(&take_arg(&args, i, "selected nodes")?, &flag)?;
+                }
+                "--mito-stable-allow-three-way" | "--allow-three-way" => {
+                    let flag = args[i].clone();
+                    i += 1;
+                    let selected =
+                        parse_name_set(&take_arg(&args, i, "allowed three-way nodes")?, &flag)?;
+                    config.mito_stable_selection_mode = MitoStableSelectionMode::AllowSelected;
+                    config.mito_stable_selected_nodes = selected.clone();
+                    config.mito_stable_allow_three_way = selected;
+                    config.mito_stable_forbid_three_way.clear();
+                }
+                "--mito-stable-forbid-three-way" | "--forbid-three-way" => {
+                    let flag = args[i].clone();
+                    i += 1;
+                    let selected =
+                        parse_name_set(&take_arg(&args, i, "forbidden three-way nodes")?, &flag)?;
+                    config.mito_stable_selection_mode = MitoStableSelectionMode::ForbidSelected;
+                    config.mito_stable_selected_nodes = selected.clone();
+                    config.mito_stable_forbid_three_way = selected;
+                    config.mito_stable_allow_three_way.clear();
+                }
+                "--mito-stable-force-link" | "--force-link" => {
+                    let flag = args[i].clone();
+                    i += 1;
+                    config.mito_stable_force_links =
+                        parse_skeleton_link_key_list(&take_arg(&args, i, "forced links")?, &flag)?;
+                }
+                "--mito-stable-drop-link" | "--drop-link" => {
+                    let flag = args[i].clone();
+                    i += 1;
+                    config.mito_stable_drop_links =
+                        parse_skeleton_link_key_list(&take_arg(&args, i, "dropped links")?, &flag)?;
                 }
                 "--read-junction-links" => {
                     config.read_junction_links = true;
@@ -1452,6 +1674,11 @@ impl Config {
                 "--minimap2" => {
                     config.run_minimap2 = true;
                 }
+                "--mito-stable" => {
+                    config.mito_stable = true;
+                    config.organelle = Some(OrganelleProfile::Mito);
+                    config.data_mode = DataMode::Standard;
+                }
                 "--help-advanced" => {
                     print_advanced_usage();
                     std::process::exit(0);
@@ -1468,6 +1695,7 @@ impl Config {
             i += 1;
         }
 
+        apply_mito_stable_selection_mode(&mut config)?;
         apply_profiles(&mut config, &overrides);
         Ok(config)
     }
@@ -1478,6 +1706,36 @@ fn apply_preset_arg(config: &mut Config, value: &str, flag: &str) -> Result<(), 
         return Err(format!("unknown {flag} value: {value}"));
     };
     apply_preset(config, preset);
+    Ok(())
+}
+
+fn apply_mito_stable_selection_mode(config: &mut Config) -> Result<(), String> {
+    match config.mito_stable_selection_mode {
+        MitoStableSelectionMode::Auto => {
+            if !config.mito_stable_selected_nodes.is_empty() {
+                return Err(
+                    "--selected-nodes requires --mx-mode forbid-selected or allow-selected"
+                        .to_string(),
+                );
+            }
+            config.mito_stable_allow_three_way.clear();
+            config.mito_stable_forbid_three_way.clear();
+        }
+        MitoStableSelectionMode::ForbidSelected => {
+            if config.mito_stable_selected_nodes.is_empty() {
+                return Err("--mx-mode forbid-selected requires --selected-nodes".to_string());
+            }
+            config.mito_stable_forbid_three_way = config.mito_stable_selected_nodes.clone();
+            config.mito_stable_allow_three_way.clear();
+        }
+        MitoStableSelectionMode::AllowSelected => {
+            if config.mito_stable_selected_nodes.is_empty() {
+                return Err("--mx-mode allow-selected requires --selected-nodes".to_string());
+            }
+            config.mito_stable_allow_three_way.clear();
+            config.mito_stable_forbid_three_way.clear();
+        }
+    }
     Ok(())
 }
 
@@ -1495,6 +1753,11 @@ fn apply_preset(config: &mut Config, preset: PresetProfile) {
             config.organelle = Some(OrganelleProfile::Mito);
             config.data_mode = DataMode::Standard;
             apply_high_preset_defaults(config);
+        }
+        PresetProfile::MitoStable => {
+            config.organelle = Some(OrganelleProfile::Mito);
+            config.data_mode = DataMode::Standard;
+            config.mito_stable = true;
         }
         PresetProfile::PlastidLow => {
             config.organelle = Some(OrganelleProfile::Plastid);
@@ -1621,6 +1884,49 @@ fn apply_profiles(config: &mut Config, overrides: &OverrideFlags) {
                 config.rounds = 1;
             }
         }
+    }
+    apply_mito_stable_profile(config, overrides);
+}
+
+fn apply_mito_stable_profile(config: &mut Config, overrides: &OverrideFlags) {
+    if !config.mito_stable {
+        return;
+    }
+    if config.organelle != Some(OrganelleProfile::Mito) || config.data_mode != DataMode::Standard {
+        return;
+    }
+    if !overrides.rounds {
+        config.rounds = 2;
+    }
+    if !overrides.min_anchor_coverage {
+        config.min_anchor_coverage = 38;
+    }
+    if !overrides.min_edge_coverage {
+        config.min_edge_coverage = 38;
+    }
+    if !overrides.min_branch_ratio {
+        config.min_branch_ratio = 0.48;
+    }
+    if !overrides.max_edges_per_state {
+        config.max_edges_per_state = 3;
+    }
+    if !overrides.min_tip_len {
+        config.min_tip_len = 3000;
+    }
+    if !overrides.min_link_support {
+        config.min_link_support = 20;
+    }
+    if !overrides.skeleton_min_link_support {
+        config.skeleton_min_link_support = 10;
+    }
+    if !overrides.skeleton_min_link_ratio {
+        config.skeleton_min_link_ratio = 0.08;
+    }
+    if !overrides.skeleton_rescue_link_support {
+        config.skeleton_rescue_link_support = 10;
+    }
+    if !overrides.bidirectional_links {
+        config.bidirectional_links = true;
     }
 }
 
@@ -1757,6 +2063,84 @@ fn parse_percent_list(value: &str, flag: &str) -> Result<Vec<ReadSubset>, String
     Ok(percents)
 }
 
+fn parse_name_set(value: &str, flag: &str) -> Result<HashSet<String>, String> {
+    let mut names = HashSet::new();
+    for raw_part in value.split(',') {
+        let part = raw_part.trim();
+        if part.is_empty() {
+            return Err(format!("invalid {flag} value: {value}"));
+        }
+        if part.chars().any(char::is_whitespace) {
+            return Err(format!("invalid {flag} node name: {part}"));
+        }
+        names.insert(part.to_string());
+    }
+    if names.is_empty() {
+        return Err(format!("{flag} requires at least one node name"));
+    }
+    Ok(names)
+}
+
+fn parse_mito_stable_selection_mode(
+    value: &str,
+    flag: &str,
+) -> Result<MitoStableSelectionMode, String> {
+    let Some(mode) = MitoStableSelectionMode::from_str(value.trim()) else {
+        return Err(format!(
+            "unknown {flag} value: {value}; expected auto, forbid-selected, or allow-selected"
+        ));
+    };
+    Ok(mode)
+}
+
+fn parse_skeleton_link_key_list(value: &str, flag: &str) -> Result<Vec<SkeletonLinkKey>, String> {
+    let mut links = Vec::new();
+    for raw_part in value.split(',') {
+        let part = raw_part.trim();
+        if part.is_empty() {
+            return Err(format!("invalid {flag} value: {value}"));
+        }
+        links.push(parse_skeleton_link_key(part, flag)?);
+    }
+    if links.is_empty() {
+        return Err(format!("{flag} requires at least one link"));
+    }
+    Ok(links)
+}
+
+fn parse_skeleton_link_key(value: &str, flag: &str) -> Result<SkeletonLinkKey, String> {
+    let fields = value.split(':').collect::<Vec<_>>();
+    if fields.len() != 4 {
+        return Err(format!(
+            "invalid {flag} link: {value}; expected from:from_orient:to:to_orient"
+        ));
+    }
+    let from = fields[0].trim();
+    let from_orient = parse_link_orient(fields[1].trim(), flag, value)?;
+    let to = fields[2].trim();
+    let to_orient = parse_link_orient(fields[3].trim(), flag, value)?;
+    if from.is_empty() || to.is_empty() {
+        return Err(format!("invalid {flag} link: {value}"));
+    }
+    Ok(SkeletonLinkKey {
+        from: from.to_string(),
+        from_orient,
+        to: to.to_string(),
+        to_orient,
+    })
+}
+
+fn parse_link_orient(value: &str, flag: &str, link: &str) -> Result<char, String> {
+    let mut chars = value.chars();
+    let Some(orient) = chars.next() else {
+        return Err(format!("invalid {flag} orientation in link: {link}"));
+    };
+    if chars.next().is_some() || !matches!(orient, '+' | '-') {
+        return Err(format!("invalid {flag} orientation in link: {link}"));
+    }
+    Ok(orient)
+}
+
 fn parse_read_subset_percent(value: &str, flag: &str) -> Result<ReadSubset, String> {
     let (whole_part, decimal_part) = match value.split_once('.') {
         Some((whole, decimal)) => (whole, Some(decimal)),
@@ -1821,11 +2205,12 @@ fn print_usage() {
         "Usage: simple_draft_asm --pacbio-hifi reads.fastq.gz -o result_graph [options]\n\
          \n\
          Common options:\n\
-           -p, --preset PRESET         ml/mito_low, ms/mito_standard, mh/mito_high;\n\
+           -p, --preset PRESET         ml/mito_low, ms/mito_standard, mh/mito_high, mx/mito_stable;\n\
                                       pl/plastid_low, ps/plastid_standard, ph/plastid_high\n\
            --organelle plastid|mito     plastid defaults to 1 round; mito defaults to 2 rounds\n\
            --data-mode standard|compact compact mode for small corrected-read datasets\n\
            --small-dataset              alias for --data-mode compact\n\
+           --mito-stable                mito complex-repeat stable mode, global bridge selection\n\
            --rounds INT                 override profile rounds\n\
            --numt-interference low|high mito profile strictness, mito default: high\n\
            -i, --pacbio-hifi FILE       input reads; may be repeated\n\
@@ -1837,6 +2222,7 @@ fn print_usage() {
            low:     user-facing preset name for compact corrected-read mode\n\
            standard: organelle standard profile; plastid stays 1 round, mito stays 2 rounds\n\
            high:    high-data mode: standard profile plus --min-link-ratio 0.30 --subsets=25,50,100\n\
+           stable:  mito complex-repeat mode with strict skeleton plus global bridge selection\n\
          \n\
          Typical commands:\n\
            simple_draft_asm -p ps -i data/plastid.fastq.gz -o result_plastid\n\
@@ -1878,6 +2264,19 @@ fn print_advanced_usage() {
            --hifi-error-rate FLOAT\n\
            --hifi-accuracy FLOAT\n\
            --minimap2\n\
+           --mito-stable\n\
+           --mx-mode auto|forbid-selected|allow-selected\n\
+                                      mito-stable node selection mode; auto is default\n\
+           --selected-nodes LIST\n\
+                                      nodes used by forbid-selected or allow-selected mx mode\n\
+           --allow-three-way LIST\n\
+                                      alias for --mx-mode allow-selected --selected-nodes LIST\n\
+           --forbid-three-way LIST\n\
+                                      alias for --mx-mode forbid-selected --selected-nodes LIST\n\
+           --force-link LINK[,LINK]\n\
+                                      mito-stable: force GFA-style links, e.g. edge_8:-:edge_4:-\n\
+           --drop-link LINK[,LINK]\n\
+                                      mito-stable: remove GFA-style links before final validation\n\
            --minimap-min-identity FLOAT\n\
            --minimap-min-align-len INT\n\
            --paf-max-link-gap INT\n\
@@ -3541,10 +3940,49 @@ struct SkeletonGraphStats {
     kept_links: usize,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+struct MitoStableTopologyStats {
+    components: usize,
+    open_ends: usize,
+    endpoint_overload: usize,
+    unique_links: usize,
+    branch_ends: usize,
+    cycle_rank: usize,
+}
+
+impl MitoStableTopologyStats {
+    fn score_key(
+        self,
+        selected_links: usize,
+        support_sum: u64,
+    ) -> (
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        std::cmp::Reverse<u64>,
+    ) {
+        (
+            self.components,
+            self.endpoint_overload,
+            self.open_ends,
+            self.cycle_rank,
+            self.unique_links,
+            self.branch_ends,
+            selected_links,
+            std::cmp::Reverse(support_sum),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum MitoCompactBridgeSource {
     LocalPaf,
     Rescue,
+    CopyChoice,
 }
 
 impl MitoCompactBridgeSource {
@@ -3552,6 +3990,7 @@ impl MitoCompactBridgeSource {
         match self {
             MitoCompactBridgeSource::LocalPaf => "local_paf",
             MitoCompactBridgeSource::Rescue => "read_walk",
+            MitoCompactBridgeSource::CopyChoice => "copy_choice",
         }
     }
 
@@ -3559,6 +3998,7 @@ impl MitoCompactBridgeSource {
         match self {
             MitoCompactBridgeSource::LocalPaf => 1,
             MitoCompactBridgeSource::Rescue => 0,
+            MitoCompactBridgeSource::CopyChoice => 2,
         }
     }
 }
@@ -3591,6 +4031,74 @@ struct MitoCompactBridgeReport {
     final_components: Vec<usize>,
     final_open_roles: usize,
     final_kept_links: usize,
+}
+
+#[derive(Debug, Clone)]
+struct MitoStableSplitPoint {
+    position: usize,
+    support: u32,
+}
+
+#[derive(Debug, Clone)]
+struct MitoStableSplitReportRow {
+    segment: String,
+    position: usize,
+    support: u32,
+}
+
+#[derive(Debug, Clone)]
+struct MitoStableSplitLayout {
+    pieces: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct MitoStableRepeatExpansion {
+    template: String,
+    clone: String,
+    removed_shortcut: SkeletonLinkKey,
+    left_link: SkeletonLinkKey,
+    right_link: SkeletonLinkKey,
+    shortcut_overlap: usize,
+    left_overlap: usize,
+    right_overlap: usize,
+    support: u32,
+}
+
+#[derive(Debug, Clone)]
+struct MitoStableManualEdit {
+    action: String,
+    key: SkeletonLinkKey,
+}
+
+#[derive(Debug, Clone)]
+struct MitoStableCopyChoiceRow {
+    node_a: String,
+    node_b: String,
+    option: String,
+    removed_links: Vec<SkeletonLinkKey>,
+    added_link: Option<SkeletonLinkKey>,
+    added_support: u32,
+    added_support_source: String,
+    components: usize,
+    open_ends: usize,
+    endpoint_overload: usize,
+    branch_ends: usize,
+    cycle_rank: usize,
+    node_a_class: &'static str,
+    node_b_class: &'static str,
+    interpretation: String,
+}
+
+#[derive(Debug, Clone)]
+struct MitoStableSelectedNodeDiagnostic {
+    segment: String,
+    left_degree: usize,
+    right_degree: usize,
+    class: &'static str,
+    selected: bool,
+    mode: String,
+    incident_base_links: Vec<String>,
+    incident_candidates: Vec<String>,
 }
 
 fn run_skeleton_linking(config: &Config) -> io::Result<()> {
@@ -3707,6 +4215,2112 @@ fn run_mito_compact_bridge_linking(config: &Config) -> io::Result<()> {
     write_skeleton_report(config, skeleton_gfa, &final_segments, &final_links)?;
     write_mito_compact_bridge_report(config, &bridge_report)?;
     Ok(())
+}
+
+fn run_mito_stable_linking(config: &Config) -> io::Result<()> {
+    let skeleton_gfa = config
+        .skeleton_gfa
+        .as_ref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--skeleton-gfa is required"))?;
+    let (mut segments, mut skeleton_links) = read_skeleton_gfa(skeleton_gfa)?;
+    if segments.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} has no S records", skeleton_gfa.display()),
+        ));
+    }
+
+    fs::create_dir_all(&config.out_dir)?;
+    let skeleton_fasta = config.out_dir.join("skeleton.segments.fasta");
+    write_skeleton_fasta(&skeleton_fasta, &segments)?;
+
+    let paf_path = config.out_dir.join("reads_to_skeleton.paf");
+    let log_path = config.out_dir.join("reads_to_skeleton.minimap2.log");
+    run_minimap2_to_target(config, &skeleton_fasta, &paf_path, &log_path)?;
+
+    let presplit_paf_by_read = read_filtered_skeleton_paf_by_read(config, &segments, &paf_path)?;
+    let split_points =
+        detect_mito_stable_internal_split_points(config, &segments, &presplit_paf_by_read);
+    let mut split_report = Vec::new();
+    if !split_points.is_empty() {
+        let presplit_fasta = config.out_dir.join("skeleton.presplit.segments.fasta");
+        let presplit_paf = config.out_dir.join("reads_to_skeleton.presplit.paf");
+        let presplit_log = config
+            .out_dir
+            .join("reads_to_skeleton.presplit.minimap2.log");
+        fs::copy(&skeleton_fasta, presplit_fasta)?;
+        fs::copy(&paf_path, presplit_paf)?;
+        if log_path.exists() {
+            fs::copy(&log_path, presplit_log)?;
+        }
+        let (refined_segments, refined_links, refined_report) =
+            apply_mito_stable_internal_splits(config, segments, skeleton_links, split_points);
+        segments = refined_segments;
+        skeleton_links = refined_links;
+        split_report = refined_report;
+        write_skeleton_fasta(&skeleton_fasta, &segments)?;
+        run_minimap2_to_target(config, &skeleton_fasta, &paf_path, &log_path)?;
+    }
+
+    let (mut depth, paf_links) = summarize_skeleton_paf(config, &segments, &paf_path)?;
+    let paf_by_read = read_filtered_skeleton_paf_by_read(config, &segments, &paf_path)?;
+    let rescue_links = match &config.skeleton_rescue_gfa {
+        Some(rescue_gfa) => read_gfa_links(rescue_gfa)?,
+        None => HashMap::new(),
+    };
+
+    let (mut base_links, mut candidates) =
+        mito_stable_base_links_and_paf_candidates(skeleton_links, paf_links);
+    refresh_skeleton_link_ratios(config, &mut base_links);
+    let initial_stats = skeleton_graph_stats(config, &segments, &base_links);
+    candidates
+        .retain(|candidate| mito_compact_candidate_is_relevant(&initial_stats, &candidate.key));
+
+    let focused_reads = mito_compact_focused_reads(&initial_stats, &paf_by_read);
+    write_mito_compact_focused_reads(config, &focused_reads)?;
+    candidates.extend(mito_compact_local_paf_candidates(
+        config,
+        &initial_stats,
+        &paf_by_read,
+        &focused_reads,
+    ));
+    candidates.extend(mito_compact_rescue_candidates(&initial_stats, rescue_links));
+    let all_candidates = dedupe_mito_bridge_candidates(candidates);
+    let all_candidate_count = all_candidates.len();
+    let copy_choice_rows =
+        analyze_mito_stable_copy_choices(config, &segments, &base_links, &all_candidates);
+    let selected_node_diagnostics =
+        analyze_mito_stable_selected_nodes(config, &segments, &base_links, &all_candidates);
+    let candidates = mito_stable_scoped_candidates(config, all_candidates.clone());
+
+    let base_topology = mito_stable_topology_stats(config, &segments, &base_links);
+    let copy_choice_bridges =
+        select_mito_stable_copy_choice_bridges(config, &base_topology, &copy_choice_rows);
+    let mut default_node_shape_violations = 0usize;
+    let mut node_constraint_fallback = false;
+    let selected = match config.mito_stable_selection_mode {
+        MitoStableSelectionMode::Auto => {
+            let mut selected =
+                select_mito_stable_bridges(config, &segments, &base_links, &candidates, false);
+            append_mito_stable_selected_bridges(&mut selected, copy_choice_bridges.clone());
+            if mito_stable_has_explicit_three_way_constraints(config) {
+                let mut trial_links = base_links.clone();
+                for candidate in &selected {
+                    insert_mito_compact_bridge(config, &mut trial_links, candidate);
+                }
+                refresh_skeleton_link_ratios(config, &mut trial_links);
+                default_node_shape_violations =
+                    mito_stable_node_shape_constraint_violations(config, &segments, &trial_links);
+                if default_node_shape_violations > 0 {
+                    node_constraint_fallback = true;
+                    selected = select_mito_stable_bridges(
+                        config,
+                        &segments,
+                        &base_links,
+                        &candidates,
+                        true,
+                    );
+                }
+            }
+            selected
+        }
+        MitoStableSelectionMode::ForbidSelected => {
+            default_node_shape_violations =
+                mito_stable_node_shape_constraint_violations(config, &segments, &base_links);
+            let mut selected =
+                select_mito_stable_bridges(config, &segments, &base_links, &candidates, true);
+            append_mito_stable_selected_bridges(&mut selected, copy_choice_bridges.clone());
+            selected
+        }
+        MitoStableSelectionMode::AllowSelected => Vec::new(),
+    };
+    let mut final_links = base_links.clone();
+    for candidate in &selected {
+        insert_mito_compact_bridge(config, &mut final_links, candidate);
+    }
+    let manual_edits = apply_mito_stable_manual_edits(config, &mut final_links);
+    refresh_skeleton_link_ratios(config, &mut final_links);
+    let repeat_expansions = if config.mito_stable_selection_mode == MitoStableSelectionMode::Auto {
+        let expansions = expand_mito_stable_repeat_shortcuts(
+            config,
+            &mut segments,
+            &mut depth,
+            &mut final_links,
+            &candidates,
+        );
+        refresh_skeleton_link_ratios(config, &mut final_links);
+        expansions
+    } else {
+        Vec::new()
+    };
+    let pruned_links = if config.mito_stable_selection_mode == MitoStableSelectionMode::Auto {
+        prune_mito_stable_redundant_links(config, &segments, &mut final_links)
+    } else {
+        Vec::new()
+    };
+    refresh_skeleton_link_ratios(config, &mut final_links);
+    let final_topology = mito_stable_topology_stats(config, &segments, &final_links);
+    let final_node_shape_violations =
+        mito_stable_node_shape_constraint_violations(config, &segments, &final_links);
+
+    write_skeleton_depth(
+        &config.out_dir.join("skeleton.depth.tsv"),
+        &segments,
+        &depth,
+    )?;
+    write_skeleton_links(&config.out_dir.join("skeleton.links.tsv"), &final_links)?;
+    write_skeleton_linked_gfa(
+        config,
+        &config.out_dir.join("skeleton.linked.gfa"),
+        &segments,
+        &depth,
+        &final_links,
+    )?;
+    copy_if_exists(
+        config.out_dir.join("skeleton.depth.tsv"),
+        config.out_dir.join("depth.tsv"),
+    )?;
+    copy_if_exists(
+        config.out_dir.join("skeleton.links.tsv"),
+        config.out_dir.join("links.tsv"),
+    )?;
+    copy_if_exists(
+        config.out_dir.join("skeleton.linked.gfa"),
+        config.out_dir.join("graph.gfa"),
+    )?;
+    write_skeleton_report(config, skeleton_gfa, &segments, &final_links)?;
+    write_mito_stable_bridge_report(
+        config,
+        &base_topology,
+        &final_topology,
+        &candidates,
+        all_candidate_count,
+        &copy_choice_bridges,
+        &selected,
+        &pruned_links,
+        &repeat_expansions,
+        &manual_edits,
+        default_node_shape_violations,
+        node_constraint_fallback,
+        final_node_shape_violations,
+    )?;
+    write_mito_stable_repeat_expansions(config, &repeat_expansions)?;
+    write_mito_stable_pruned_links(config, &pruned_links)?;
+    write_mito_stable_manual_edits(config, &manual_edits)?;
+    write_mito_stable_copy_choices(config, &copy_choice_rows)?;
+    write_mito_stable_selected_node_diagnostics(config, &selected_node_diagnostics)?;
+    write_mito_stable_node_degrees(config, &segments, &final_links)?;
+    write_mito_stable_node_repairs(
+        config,
+        &segments,
+        &base_links,
+        &final_links,
+        &selected,
+        &manual_edits,
+        &pruned_links,
+        &repeat_expansions,
+    )?;
+    write_mito_stable_topology_scan(config, &segments, &final_links)?;
+    write_mito_stable_split_report(config, &split_report)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct MitoStablePafLocus {
+    segment: String,
+    coord: usize,
+    tlen: usize,
+}
+
+fn detect_mito_stable_internal_split_points(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    paf_by_read: &HashMap<String, Vec<PafAln>>,
+) -> HashMap<String, Vec<MitoStableSplitPoint>> {
+    let segment_lengths: HashMap<String, usize> = segments
+        .iter()
+        .map(|segment| (segment.name.clone(), segment.sequence.len()))
+        .collect();
+    let mut events: HashMap<String, Vec<usize>> = HashMap::new();
+    let max_gap = config.paf_max_link_gap;
+    for alns in paf_by_read.values() {
+        let chain = paf_non_overlapping_chain(alns.clone(), max_gap);
+        for pair in chain.windows(2) {
+            let left = &pair[0];
+            let right = &pair[1];
+            let gap = right.qstart as isize - left.qend as isize;
+            if gap.abs() > max_gap {
+                continue;
+            }
+            let left_locus = mito_stable_paf_exit_locus(left);
+            let right_locus = mito_stable_paf_entry_locus(right);
+            if mito_stable_locus_is_split_candidate(config, &segment_lengths, &left_locus) {
+                events
+                    .entry(left_locus.segment.clone())
+                    .or_default()
+                    .push(left_locus.coord);
+            }
+            if mito_stable_locus_is_split_candidate(config, &segment_lengths, &right_locus) {
+                events
+                    .entry(right_locus.segment.clone())
+                    .or_default()
+                    .push(right_locus.coord);
+            }
+        }
+    }
+
+    let min_support = mito_stable_internal_split_min_support(config);
+    let cluster_slop = config.skeleton_end_slop.max(500);
+    let min_piece_len = mito_stable_min_split_piece_len(config);
+    let mut split_points = HashMap::new();
+    for (segment, mut coords) in events {
+        coords.sort_unstable();
+        let Some(&segment_len) = segment_lengths.get(&segment) else {
+            continue;
+        };
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+        for coord in coords {
+            if let Some(last_cluster) = clusters.last_mut() {
+                let center =
+                    last_cluster.iter().copied().sum::<usize>() / last_cluster.len().max(1);
+                if coord.abs_diff(center) <= cluster_slop {
+                    last_cluster.push(coord);
+                    continue;
+                }
+            }
+            clusters.push(vec![coord]);
+        }
+
+        let mut points = Vec::new();
+        for cluster in clusters {
+            let support = cluster.len() as u32;
+            if support < min_support {
+                continue;
+            }
+            let position = cluster.iter().copied().sum::<usize>() / cluster.len().max(1);
+            if position < min_piece_len || segment_len.saturating_sub(position) < min_piece_len {
+                continue;
+            }
+            points.push(MitoStableSplitPoint { position, support });
+        }
+        points.sort_by_key(|point| point.position);
+        if !points.is_empty() {
+            split_points.insert(segment, points);
+        }
+    }
+    split_points
+}
+
+fn mito_stable_paf_exit_locus(aln: &PafAln) -> MitoStablePafLocus {
+    let coord = if aln.strand == '+' {
+        aln.tend
+    } else {
+        aln.tstart
+    };
+    MitoStablePafLocus {
+        segment: aln.tname.clone(),
+        coord,
+        tlen: aln.tlen,
+    }
+}
+
+fn mito_stable_paf_entry_locus(aln: &PafAln) -> MitoStablePafLocus {
+    let coord = if aln.strand == '+' {
+        aln.tstart
+    } else {
+        aln.tend
+    };
+    MitoStablePafLocus {
+        segment: aln.tname.clone(),
+        coord,
+        tlen: aln.tlen,
+    }
+}
+
+fn mito_stable_locus_is_split_candidate(
+    config: &Config,
+    segment_lengths: &HashMap<String, usize>,
+    locus: &MitoStablePafLocus,
+) -> bool {
+    let segment_len = segment_lengths
+        .get(&locus.segment)
+        .copied()
+        .unwrap_or(locus.tlen);
+    locus.coord > config.skeleton_end_slop
+        && segment_len.saturating_sub(locus.coord) > config.skeleton_end_slop
+}
+
+fn mito_stable_internal_split_min_support(config: &Config) -> u32 {
+    config.skeleton_min_link_support.max(30)
+}
+
+fn mito_stable_min_split_piece_len(config: &Config) -> usize {
+    config.skeleton_end_slop.min(1_000).max(500)
+}
+
+fn apply_mito_stable_internal_splits(
+    config: &Config,
+    segments: Vec<SkeletonSegment>,
+    links: HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    split_points: HashMap<String, Vec<MitoStableSplitPoint>>,
+) -> (
+    Vec<SkeletonSegment>,
+    HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    Vec<MitoStableSplitReportRow>,
+) {
+    let mut layouts: HashMap<String, MitoStableSplitLayout> = HashMap::new();
+    let mut refined_segments = Vec::new();
+    let mut report = Vec::new();
+
+    for segment in segments {
+        let mut breakpoints: Vec<_> = split_points
+            .get(&segment.name)
+            .map(|points| {
+                points
+                    .iter()
+                    .map(|point| (point.position, point.support))
+                    .collect()
+            })
+            .unwrap_or_default();
+        breakpoints.sort_unstable_by_key(|(position, _)| *position);
+        breakpoints.dedup_by_key(|(position, _)| *position);
+        if breakpoints.is_empty() {
+            layouts.insert(
+                segment.name.clone(),
+                MitoStableSplitLayout {
+                    pieces: vec![segment.name.clone()],
+                },
+            );
+            refined_segments.push(segment);
+            continue;
+        }
+
+        let mut cuts = Vec::with_capacity(breakpoints.len() + 2);
+        cuts.push(0usize);
+        for (position, support) in breakpoints {
+            if position == 0 || position >= segment.sequence.len() {
+                continue;
+            }
+            cuts.push(position);
+            report.push(MitoStableSplitReportRow {
+                segment: segment.name.clone(),
+                position,
+                support,
+            });
+        }
+        cuts.push(segment.sequence.len());
+        cuts.sort_unstable();
+        cuts.dedup();
+
+        if cuts.len() <= 2 {
+            layouts.insert(
+                segment.name.clone(),
+                MitoStableSplitLayout {
+                    pieces: vec![segment.name.clone()],
+                },
+            );
+            refined_segments.push(segment);
+            continue;
+        }
+
+        let mut piece_names = Vec::new();
+        for (index, window) in cuts.windows(2).enumerate() {
+            let start = window[0];
+            let end = window[1];
+            if start >= end {
+                continue;
+            }
+            let name = format!("{}_s{}", segment.name, index);
+            piece_names.push(name.clone());
+            refined_segments.push(SkeletonSegment {
+                name,
+                sequence: segment.sequence[start..end].to_string(),
+            });
+        }
+        layouts.insert(
+            segment.name,
+            MitoStableSplitLayout {
+                pieces: piece_names,
+            },
+        );
+    }
+
+    let mut refined_links: HashMap<SkeletonLinkKey, SkeletonLinkSupport> = HashMap::new();
+    for (key, support) in links {
+        let from = mito_stable_split_exit(&layouts, &key.from, key.from_orient);
+        let to = mito_stable_split_entry(&layouts, &key.to, key.to_orient);
+        let Some((from_name, from_orient)) = from else {
+            continue;
+        };
+        let Some((to_name, to_orient)) = to else {
+            continue;
+        };
+        let refined_key = SkeletonLinkKey {
+            from: from_name,
+            from_orient,
+            to: to_name,
+            to_orient,
+        };
+        merge_skeleton_link_support(&mut refined_links, refined_key, support);
+    }
+
+    let internal_support = config
+        .min_link_support
+        .max(config.skeleton_min_link_support)
+        .max(1);
+    for layout in layouts.values() {
+        for pair in layout.pieces.windows(2) {
+            let key = SkeletonLinkKey {
+                from: pair[0].clone(),
+                from_orient: '+',
+                to: pair[1].clone(),
+                to_orient: '+',
+            };
+            insert_mito_stable_internal_link(config, &mut refined_links, key, internal_support);
+        }
+    }
+
+    report.sort_by(|left, right| {
+        left.segment
+            .cmp(&right.segment)
+            .then_with(|| left.position.cmp(&right.position))
+    });
+    (refined_segments, refined_links, report)
+}
+
+fn mito_stable_split_exit(
+    layouts: &HashMap<String, MitoStableSplitLayout>,
+    segment: &str,
+    orient: char,
+) -> Option<(String, char)> {
+    let layout = layouts.get(segment)?;
+    if orient == '+' {
+        layout.pieces.last().cloned().map(|piece| (piece, '+'))
+    } else {
+        layout.pieces.first().cloned().map(|piece| (piece, '-'))
+    }
+}
+
+fn mito_stable_split_entry(
+    layouts: &HashMap<String, MitoStableSplitLayout>,
+    segment: &str,
+    orient: char,
+) -> Option<(String, char)> {
+    let layout = layouts.get(segment)?;
+    if orient == '+' {
+        layout.pieces.first().cloned().map(|piece| (piece, '+'))
+    } else {
+        layout.pieces.last().cloned().map(|piece| (piece, '-'))
+    }
+}
+
+fn merge_skeleton_link_support(
+    links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    key: SkeletonLinkKey,
+    support: SkeletonLinkSupport,
+) {
+    let entry = links.entry(key).or_default();
+    entry.skeleton_support = entry.skeleton_support.max(support.skeleton_support);
+    entry.paf_support = entry.paf_support.max(support.paf_support);
+    entry.rescue_support = entry.rescue_support.max(support.rescue_support);
+    entry.out_ratio = entry.out_ratio.max(support.out_ratio);
+    entry.in_ratio = entry.in_ratio.max(support.in_ratio);
+}
+
+fn insert_mito_stable_internal_link(
+    config: &Config,
+    links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    key: SkeletonLinkKey,
+    support: u32,
+) {
+    links.entry(key.clone()).or_default().skeleton_support = support;
+    if config.bidirectional_links {
+        let rc = reverse_skeleton_link_key(&key);
+        links.entry(rc).or_default().skeleton_support = support;
+    }
+}
+
+fn mito_stable_base_links_and_paf_candidates(
+    mut base_links: HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    paf_links: HashMap<SkeletonLinkKey, u32>,
+) -> (
+    HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    Vec<MitoCompactBridgeCandidate>,
+) {
+    let mut candidates = Vec::new();
+    for (key, support) in paf_links {
+        if let Some(entry) = base_links.get_mut(&key) {
+            entry.paf_support += support;
+        } else {
+            candidates.push(MitoCompactBridgeCandidate {
+                key,
+                support,
+                source: MitoCompactBridgeSource::LocalPaf,
+            });
+        }
+    }
+    (base_links, candidates)
+}
+
+fn dedupe_mito_bridge_candidates(
+    candidates: Vec<MitoCompactBridgeCandidate>,
+) -> Vec<MitoCompactBridgeCandidate> {
+    let mut by_key: HashMap<SkeletonLinkKey, MitoCompactBridgeCandidate> = HashMap::new();
+    for candidate in candidates {
+        let canonical = canonical_skeleton_link_key(&candidate.key);
+        by_key
+            .entry(canonical)
+            .and_modify(|old| {
+                let old_score = (old.source.priority(), old.support);
+                let new_score = (candidate.source.priority(), candidate.support);
+                if new_score > old_score {
+                    *old = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
+    }
+    let mut candidates: Vec<_> = by_key.into_values().collect();
+    candidates.sort_by(|left, right| {
+        right
+            .source
+            .priority()
+            .cmp(&left.source.priority())
+            .then_with(|| right.support.cmp(&left.support))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    candidates
+}
+
+fn canonical_skeleton_link_key(key: &SkeletonLinkKey) -> SkeletonLinkKey {
+    let rc = reverse_skeleton_link_key(key);
+    if *key <= rc {
+        key.clone()
+    } else {
+        rc
+    }
+}
+
+fn select_mito_stable_bridges(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    base_links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    candidates: &[MitoCompactBridgeCandidate],
+    respect_node_constraints: bool,
+) -> Vec<MitoCompactBridgeCandidate> {
+    if candidates.len() <= 20 {
+        return select_mito_stable_bridges_exhaustive(
+            config,
+            segments,
+            base_links,
+            candidates,
+            respect_node_constraints,
+        );
+    }
+    select_mito_stable_bridges_beam(
+        config,
+        segments,
+        base_links,
+        candidates,
+        respect_node_constraints,
+    )
+}
+
+fn mito_stable_scoped_candidates(
+    config: &Config,
+    candidates: Vec<MitoCompactBridgeCandidate>,
+) -> Vec<MitoCompactBridgeCandidate> {
+    match config.mito_stable_selection_mode {
+        MitoStableSelectionMode::Auto => candidates,
+        MitoStableSelectionMode::ForbidSelected | MitoStableSelectionMode::AllowSelected => {
+            candidates
+                .into_iter()
+                .filter(|candidate| {
+                    config
+                        .mito_stable_selected_nodes
+                        .contains(&candidate.key.from)
+                        || config
+                            .mito_stable_selected_nodes
+                            .contains(&candidate.key.to)
+                })
+                .collect()
+        }
+    }
+}
+
+fn append_mito_stable_selected_bridges(
+    selected: &mut Vec<MitoCompactBridgeCandidate>,
+    extra: Vec<MitoCompactBridgeCandidate>,
+) {
+    let mut seen_physical: HashSet<_> = selected
+        .iter()
+        .map(|candidate| canonical_mito_stable_physical_link(&candidate.key))
+        .collect();
+    for candidate in extra {
+        if seen_physical.insert(canonical_mito_stable_physical_link(&candidate.key)) {
+            selected.push(candidate);
+        }
+    }
+}
+
+fn select_mito_stable_bridges_exhaustive(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    base_links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    candidates: &[MitoCompactBridgeCandidate],
+    respect_node_constraints: bool,
+) -> Vec<MitoCompactBridgeCandidate> {
+    let mut best_mask = 0usize;
+    let mut best_score = None;
+    let mask_count = 1usize << candidates.len();
+    for mask in 0..mask_count {
+        let mut trial_links = base_links.clone();
+        let mut selected_count = 0usize;
+        let mut support_sum = 0u64;
+        for (index, candidate) in candidates.iter().enumerate() {
+            if (mask & (1usize << index)) == 0 {
+                continue;
+            }
+            insert_mito_compact_bridge(config, &mut trial_links, candidate);
+            selected_count += 1;
+            support_sum += candidate.support as u64;
+        }
+        refresh_skeleton_link_ratios(config, &mut trial_links);
+        let score = mito_stable_bridge_selection_score(
+            config,
+            segments,
+            &trial_links,
+            selected_count,
+            support_sum,
+            respect_node_constraints,
+        );
+        if best_score.as_ref().is_none_or(|best| score < *best) {
+            best_score = Some(score);
+            best_mask = mask;
+        }
+    }
+
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| (best_mask & (1usize << index)) != 0)
+        .map(|(_, candidate)| candidate.clone())
+        .collect()
+}
+
+#[derive(Clone)]
+struct MitoStableBeamState {
+    links: HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    selected: Vec<MitoCompactBridgeCandidate>,
+    support_sum: u64,
+}
+
+fn select_mito_stable_bridges_beam(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    base_links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    candidates: &[MitoCompactBridgeCandidate],
+    respect_node_constraints: bool,
+) -> Vec<MitoCompactBridgeCandidate> {
+    const BEAM_WIDTH: usize = 256;
+    let mut states = vec![MitoStableBeamState {
+        links: base_links.clone(),
+        selected: Vec::new(),
+        support_sum: 0,
+    }];
+
+    for candidate in candidates {
+        let mut next = Vec::with_capacity(states.len() * 2);
+        for state in states {
+            next.push(state.clone());
+            let mut with_candidate = state;
+            insert_mito_compact_bridge(config, &mut with_candidate.links, candidate);
+            with_candidate.selected.push(candidate.clone());
+            with_candidate.support_sum += candidate.support as u64;
+            next.push(with_candidate);
+        }
+        for state in &mut next {
+            refresh_skeleton_link_ratios(config, &mut state.links);
+        }
+        next.sort_by_key(|state| {
+            mito_stable_bridge_selection_score(
+                config,
+                segments,
+                &state.links,
+                state.selected.len(),
+                state.support_sum,
+                respect_node_constraints,
+            )
+        });
+        next.truncate(BEAM_WIDTH);
+        states = next;
+    }
+
+    states
+        .into_iter()
+        .min_by_key(|state| {
+            mito_stable_bridge_selection_score(
+                config,
+                segments,
+                &state.links,
+                state.selected.len(),
+                state.support_sum,
+                respect_node_constraints,
+            )
+        })
+        .map(|state| state.selected)
+        .unwrap_or_default()
+}
+
+fn mito_stable_bridge_selection_score(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    selected_links: usize,
+    support_sum: u64,
+    respect_node_constraints: bool,
+) -> (
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    std::cmp::Reverse<u64>,
+) {
+    let constraint_violations = if respect_node_constraints {
+        mito_stable_node_shape_constraint_violations(config, segments, links)
+    } else {
+        0
+    };
+    let topology = mito_stable_topology_stats(config, segments, links);
+    let (
+        components,
+        endpoint_overload,
+        open_ends,
+        cycle_rank,
+        unique_links,
+        branch_ends,
+        selected_links,
+        support_sum,
+    ) = topology.score_key(selected_links, support_sum);
+    (
+        constraint_violations,
+        components,
+        endpoint_overload,
+        open_ends,
+        cycle_rank,
+        unique_links,
+        branch_ends,
+        selected_links,
+        support_sum,
+    )
+}
+
+fn mito_stable_topology_stats(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> MitoStableTopologyStats {
+    let mut segment_names = HashSet::new();
+    let mut endpoint_degree: HashMap<(String, char), usize> = HashMap::new();
+    let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut unique_links = HashSet::new();
+
+    for segment in segments {
+        segment_names.insert(segment.name.clone());
+        adj.entry(segment.name.clone()).or_default();
+    }
+
+    for (key, support) in links {
+        if !keep_skeleton_link(config, support) {
+            continue;
+        }
+        if !segment_names.contains(&key.from) || !segment_names.contains(&key.to) {
+            continue;
+        }
+        let left = skeleton_physical_from_end(&key.from, key.from_orient);
+        let right = skeleton_physical_to_end(&key.to, key.to_orient);
+        let edge = if left <= right {
+            (left.clone(), right.clone())
+        } else {
+            (right.clone(), left.clone())
+        };
+        if unique_links.insert(edge) {
+            *endpoint_degree.entry(left).or_insert(0) += 1;
+            *endpoint_degree.entry(right).or_insert(0) += 1;
+            adj.entry(key.from.clone())
+                .or_default()
+                .insert(key.to.clone());
+            adj.entry(key.to.clone())
+                .or_default()
+                .insert(key.from.clone());
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut components = 0usize;
+    for segment in segments {
+        if !seen.insert(segment.name.clone()) {
+            continue;
+        }
+        components += 1;
+        let mut stack = vec![segment.name.clone()];
+        while let Some(node) = stack.pop() {
+            if let Some(neighbors) = adj.get(&node) {
+                for neighbor in neighbors {
+                    if seen.insert(neighbor.clone()) {
+                        stack.push(neighbor.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut open_ends = 0usize;
+    let mut endpoint_overload = 0usize;
+    let mut branch_ends = 0usize;
+    for segment in segments {
+        for end in ['L', 'R'] {
+            let degree = endpoint_degree
+                .get(&(segment.name.clone(), end))
+                .copied()
+                .unwrap_or(0);
+            if degree == 0 {
+                open_ends += 1;
+            }
+            if degree > 1 {
+                branch_ends += 1;
+            }
+            endpoint_overload += degree.saturating_sub(2);
+        }
+    }
+    let cycle_rank = unique_links
+        .len()
+        .saturating_add(components)
+        .saturating_sub(segments.len());
+
+    MitoStableTopologyStats {
+        components,
+        open_ends,
+        endpoint_overload,
+        unique_links: unique_links.len(),
+        branch_ends,
+        cycle_rank,
+    }
+}
+
+fn mito_stable_physical_side_degrees(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> HashMap<String, (usize, usize)> {
+    let segment_names: HashSet<_> = segments
+        .iter()
+        .map(|segment| segment.name.clone())
+        .collect();
+    let mut degrees: HashMap<String, (usize, usize)> = segments
+        .iter()
+        .map(|segment| (segment.name.clone(), (0, 0)))
+        .collect();
+    let mut seen = HashSet::new();
+    for (key, support) in links {
+        if !keep_skeleton_link(config, support) {
+            continue;
+        }
+        if !segment_names.contains(&key.from) || !segment_names.contains(&key.to) {
+            continue;
+        }
+        let left = skeleton_physical_from_end(&key.from, key.from_orient);
+        let right = skeleton_physical_to_end(&key.to, key.to_orient);
+        let edge = if left <= right {
+            (left.clone(), right.clone())
+        } else {
+            (right.clone(), left.clone())
+        };
+        if !seen.insert(edge) {
+            continue;
+        }
+        increment_mito_stable_side_degree(&mut degrees, &left);
+        increment_mito_stable_side_degree(&mut degrees, &right);
+    }
+    degrees
+}
+
+fn increment_mito_stable_side_degree(
+    degrees: &mut HashMap<String, (usize, usize)>,
+    endpoint: &(String, char),
+) {
+    let entry = degrees.entry(endpoint.0.clone()).or_insert((0, 0));
+    if endpoint.1 == 'L' {
+        entry.0 += 1;
+    } else {
+        entry.1 += 1;
+    }
+}
+
+fn mito_stable_three_way_nodes(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> HashSet<String> {
+    mito_stable_physical_side_degrees(config, segments, links)
+        .into_iter()
+        .filter_map(|(segment, (left_degree, right_degree))| {
+            if (left_degree == 1 && right_degree == 2) || (left_degree == 2 && right_degree == 1) {
+                Some(segment)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn mito_stable_introduces_new_three_way_nodes(
+    config: &Config,
+    before_segments: &[SkeletonSegment],
+    before_links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    after_segments: &[SkeletonSegment],
+    after_links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> bool {
+    let before = mito_stable_three_way_nodes(config, before_segments, before_links);
+    let after = mito_stable_three_way_nodes(config, after_segments, after_links);
+    after.iter().any(|segment| !before.contains(segment))
+}
+
+fn mito_stable_has_explicit_three_way_constraints(config: &Config) -> bool {
+    !config.mito_stable_allow_three_way.is_empty()
+        || !config.mito_stable_forbid_three_way.is_empty()
+}
+
+fn mito_stable_node_constraints_ok(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> bool {
+    mito_stable_three_way_constraint_violations(config, segments, links) == 0
+}
+
+fn mito_stable_three_way_constraint_violations(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> usize {
+    if !mito_stable_has_explicit_three_way_constraints(config) {
+        return 0;
+    }
+    let three_way = mito_stable_three_way_nodes(config, segments, links);
+    let mut violations = HashSet::new();
+    for segment in three_way {
+        if config.mito_stable_forbid_three_way.contains(&segment)
+            || (!config.mito_stable_allow_three_way.is_empty()
+                && !config.mito_stable_allow_three_way.contains(&segment))
+        {
+            violations.insert(segment);
+        }
+    }
+    violations.len()
+}
+
+fn mito_stable_node_shape_constraint_violations(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> usize {
+    if !mito_stable_has_explicit_three_way_constraints(config) {
+        return 0;
+    }
+    let mut violations = HashSet::new();
+    for (segment, (left_degree, right_degree)) in
+        mito_stable_physical_side_degrees(config, segments, links)
+    {
+        match mito_stable_node_degree_class(left_degree, right_degree) {
+            "1-1" | "2-2" => {}
+            "three_way" => {
+                if config.mito_stable_forbid_three_way.contains(&segment)
+                    || (!config.mito_stable_allow_three_way.is_empty()
+                        && !config.mito_stable_allow_three_way.contains(&segment))
+                {
+                    violations.insert(segment);
+                }
+            }
+            _ => {
+                violations.insert(segment);
+            }
+        }
+    }
+    violations.len()
+}
+
+fn mito_stable_node_constraints_ok_for_transition(
+    config: &Config,
+    before_segments: &[SkeletonSegment],
+    before_links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    after_segments: &[SkeletonSegment],
+    after_links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> bool {
+    if mito_stable_has_explicit_three_way_constraints(config) {
+        return mito_stable_node_constraints_ok(config, after_segments, after_links);
+    }
+    !mito_stable_introduces_new_three_way_nodes(
+        config,
+        before_segments,
+        before_links,
+        after_segments,
+        after_links,
+    )
+}
+
+fn mito_stable_node_degree_class(left_degree: usize, right_degree: usize) -> &'static str {
+    match (left_degree, right_degree) {
+        (1, 1) => "1-1",
+        (2, 2) => "2-2",
+        (1, 2) | (2, 1) => "three_way",
+        _ => "other",
+    }
+}
+
+fn expand_mito_stable_repeat_shortcuts(
+    config: &Config,
+    segments: &mut Vec<SkeletonSegment>,
+    depth: &mut HashMap<String, (usize, usize)>,
+    links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    candidates: &[MitoCompactBridgeCandidate],
+) -> Vec<MitoStableRepeatExpansion> {
+    const MAX_EXPANSIONS: usize = 16;
+    let mut expansions = Vec::new();
+
+    while expansions.len() < MAX_EXPANSIONS {
+        let Some(expansion) =
+            best_mito_stable_repeat_expansion(config, segments, links, candidates)
+        else {
+            break;
+        };
+
+        let Some(template_segment) = segments
+            .iter()
+            .find(|segment| segment.name == expansion.template)
+            .cloned()
+        else {
+            break;
+        };
+
+        let mut left_support =
+            skeleton_link_support_for_key(links, &expansion.left_link).unwrap_or_default();
+        remove_mito_stable_physical_link_pair(links, &expansion.removed_shortcut);
+        remove_mito_stable_physical_link_pair(links, &expansion.left_link);
+
+        if left_support.skeleton_support == 0
+            && left_support.paf_support == 0
+            && left_support.rescue_support == 0
+        {
+            left_support.skeleton_support = expansion.support;
+        }
+        let mut right_support =
+            mito_stable_available_link_support(config, links, candidates, &expansion.right_link)
+                .unwrap_or_default();
+        if right_support.skeleton_support == 0
+            && right_support.paf_support == 0
+            && right_support.rescue_support == 0
+        {
+            right_support.paf_support = expansion.support;
+        }
+
+        let clone_name = expansion.clone.clone();
+        segments.push(SkeletonSegment {
+            name: clone_name.clone(),
+            sequence: template_segment.sequence,
+        });
+        if let Some(template_depth) = depth.get(&expansion.template).copied() {
+            depth.insert(clone_name.clone(), template_depth);
+        }
+
+        let mut left_clone = expansion.left_link.clone();
+        left_clone.to = clone_name.clone();
+        let mut right_clone = expansion.right_link.clone();
+        right_clone.from = clone_name;
+        insert_mito_stable_supported_link_pair(config, links, left_clone, left_support);
+        insert_mito_stable_supported_link_pair(config, links, right_clone, right_support);
+
+        expansions.push(expansion);
+        refresh_skeleton_link_ratios(config, links);
+    }
+
+    expansions
+}
+
+fn best_mito_stable_repeat_expansion(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    candidates: &[MitoCompactBridgeCandidate],
+) -> Option<MitoStableRepeatExpansion> {
+    const MIN_REPEAT_OVERLAP: usize = 100;
+    const MAX_SHORTCUT_OVERLAP: usize = 20;
+
+    let sequence_by_segment: HashMap<String, String> = segments
+        .iter()
+        .map(|segment| (segment.name.clone(), segment.sequence.clone()))
+        .collect();
+    let available = mito_stable_available_links(config, links, candidates);
+    let mut seen_physical = HashSet::new();
+    let mut best: Option<(
+        std::cmp::Reverse<usize>,
+        std::cmp::Reverse<u32>,
+        u32,
+        MitoStableRepeatExpansion,
+    )> = None;
+    let mut clone_index = 0usize;
+
+    for (shortcut, shortcut_support) in links {
+        if !keep_skeleton_link(config, shortcut_support) {
+            continue;
+        }
+        if shortcut_support.skeleton_support > 0 || shortcut_support.rescue_support > 0 {
+            continue;
+        }
+        if !seen_physical.insert(canonical_mito_stable_physical_link(shortcut)) {
+            continue;
+        }
+
+        let shortcut_forms = [shortcut.clone(), reverse_skeleton_link_key(shortcut)];
+        for shortcut_key in shortcut_forms {
+            let shortcut_overlap =
+                skeleton_link_exact_overlap(&sequence_by_segment, &shortcut_key, 2_000);
+            if shortcut_overlap > MAX_SHORTCUT_OVERLAP {
+                continue;
+            }
+
+            for (left_key, left_support) in &available {
+                if left_key.from != shortcut_key.from
+                    || left_key.from_orient != shortcut_key.from_orient
+                    || left_key.to == shortcut_key.to
+                {
+                    continue;
+                }
+                if !skeleton_link_pair_is_kept(config, links, left_key) {
+                    continue;
+                }
+                let left_overlap =
+                    skeleton_link_exact_overlap(&sequence_by_segment, left_key, 2_000);
+                if left_overlap < MIN_REPEAT_OVERLAP {
+                    continue;
+                }
+
+                let right_key = SkeletonLinkKey {
+                    from: left_key.to.clone(),
+                    from_orient: left_key.to_orient,
+                    to: shortcut_key.to.clone(),
+                    to_orient: shortcut_key.to_orient,
+                };
+                let Some(right_support) = available.get(&right_key) else {
+                    continue;
+                };
+                let right_overlap =
+                    skeleton_link_exact_overlap(&sequence_by_segment, &right_key, 2_000);
+                if right_overlap < MIN_REPEAT_OVERLAP {
+                    continue;
+                }
+                if right_support.paf_support.max(right_support.rescue_support)
+                    < config.skeleton_min_link_support
+                    && right_support.skeleton_support < config.min_link_support
+                {
+                    continue;
+                }
+
+                let support = left_support
+                    .skeleton_support
+                    .max(left_support.paf_support)
+                    .max(left_support.rescue_support)
+                    .min(
+                        right_support
+                            .skeleton_support
+                            .max(right_support.paf_support)
+                            .max(right_support.rescue_support),
+                    );
+                let clone =
+                    unique_mito_stable_clone_name(&sequence_by_segment, &left_key.to, clone_index);
+                clone_index += 1;
+                let expansion = MitoStableRepeatExpansion {
+                    template: left_key.to.clone(),
+                    clone,
+                    removed_shortcut: shortcut_key.clone(),
+                    left_link: left_key.clone(),
+                    right_link: right_key,
+                    shortcut_overlap,
+                    left_overlap,
+                    right_overlap,
+                    support,
+                };
+                if !mito_stable_repeat_expansion_topology_ok(
+                    config, segments, links, &available, &expansion,
+                ) {
+                    continue;
+                }
+                let score = (
+                    std::cmp::Reverse(left_overlap.min(right_overlap)),
+                    std::cmp::Reverse(support),
+                    shortcut_support.paf_support,
+                    expansion,
+                );
+                if best.as_ref().is_none_or(|old| score < *old) {
+                    best = Some(score);
+                }
+            }
+        }
+    }
+
+    best.map(|(_, _, _, expansion)| expansion)
+}
+
+fn mito_stable_repeat_expansion_topology_ok(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    available: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    expansion: &MitoStableRepeatExpansion,
+) -> bool {
+    let before = mito_stable_topology_stats(config, segments, links);
+    let Some(template_segment) = segments
+        .iter()
+        .find(|segment| segment.name == expansion.template)
+    else {
+        return false;
+    };
+    let mut trial_segments = segments.to_vec();
+    trial_segments.push(SkeletonSegment {
+        name: expansion.clone.clone(),
+        sequence: template_segment.sequence.clone(),
+    });
+
+    let mut trial_links = links.clone();
+    let left_support =
+        skeleton_link_support_for_key(&trial_links, &expansion.left_link).unwrap_or_default();
+    let right_support = available
+        .get(&expansion.right_link)
+        .cloned()
+        .unwrap_or_default();
+    remove_mito_stable_physical_link_pair(&mut trial_links, &expansion.removed_shortcut);
+    remove_mito_stable_physical_link_pair(&mut trial_links, &expansion.left_link);
+
+    let mut left_clone = expansion.left_link.clone();
+    left_clone.to = expansion.clone.clone();
+    let mut right_clone = expansion.right_link.clone();
+    right_clone.from = expansion.clone.clone();
+    insert_mito_stable_supported_link_pair(config, &mut trial_links, left_clone, left_support);
+    insert_mito_stable_supported_link_pair(config, &mut trial_links, right_clone, right_support);
+    refresh_skeleton_link_ratios(config, &mut trial_links);
+
+    let after = mito_stable_topology_stats(config, &trial_segments, &trial_links);
+    after.components <= before.components
+        && after.open_ends <= before.open_ends
+        && after.endpoint_overload <= before.endpoint_overload
+        && after.unique_links <= before.unique_links
+        && (after.branch_ends < before.branch_ends || after.cycle_rank < before.cycle_rank)
+        && mito_stable_node_constraints_ok_for_transition(
+            config,
+            segments,
+            links,
+            &trial_segments,
+            &trial_links,
+        )
+}
+
+fn unique_mito_stable_clone_name(
+    sequence_by_segment: &HashMap<String, String>,
+    template: &str,
+    mut index: usize,
+) -> String {
+    loop {
+        let name = format!("{}_copy{}", template, index);
+        if !sequence_by_segment.contains_key(&name) {
+            return name;
+        }
+        index += 1;
+    }
+}
+
+fn mito_stable_available_links(
+    config: &Config,
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    candidates: &[MitoCompactBridgeCandidate],
+) -> HashMap<SkeletonLinkKey, SkeletonLinkSupport> {
+    let mut available = links.clone();
+    for candidate in candidates {
+        let mut support = SkeletonLinkSupport::default();
+        match candidate.source {
+            MitoCompactBridgeSource::LocalPaf | MitoCompactBridgeSource::CopyChoice => {
+                support.paf_support = candidate.support;
+            }
+            MitoCompactBridgeSource::Rescue => support.rescue_support = candidate.support,
+        }
+        merge_skeleton_link_support(&mut available, candidate.key.clone(), support.clone());
+        if config.bidirectional_links {
+            merge_skeleton_link_support(
+                &mut available,
+                reverse_skeleton_link_key(&candidate.key),
+                support,
+            );
+        }
+    }
+    available
+}
+
+fn mito_stable_available_link_support(
+    config: &Config,
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    candidates: &[MitoCompactBridgeCandidate],
+    key: &SkeletonLinkKey,
+) -> Option<SkeletonLinkSupport> {
+    mito_stable_available_links(config, links, candidates)
+        .get(key)
+        .cloned()
+}
+
+fn skeleton_link_support_for_key(
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    key: &SkeletonLinkKey,
+) -> Option<SkeletonLinkSupport> {
+    links
+        .get(key)
+        .cloned()
+        .or_else(|| links.get(&reverse_skeleton_link_key(key)).cloned())
+}
+
+fn skeleton_link_pair_is_kept(
+    config: &Config,
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    key: &SkeletonLinkKey,
+) -> bool {
+    skeleton_link_support_for_key(links, key)
+        .is_some_and(|support| keep_skeleton_link(config, &support))
+}
+
+fn insert_mito_stable_supported_link_pair(
+    config: &Config,
+    links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    key: SkeletonLinkKey,
+    support: SkeletonLinkSupport,
+) {
+    merge_skeleton_link_support(links, key.clone(), support.clone());
+    if config.bidirectional_links {
+        merge_skeleton_link_support(links, reverse_skeleton_link_key(&key), support);
+    }
+}
+
+fn skeleton_link_exact_overlap(
+    sequence_by_segment: &HashMap<String, String>,
+    key: &SkeletonLinkKey,
+    max_overlap: usize,
+) -> usize {
+    let Some(from_sequence) = sequence_by_segment.get(&key.from) else {
+        return 0;
+    };
+    let Some(to_sequence) = sequence_by_segment.get(&key.to) else {
+        return 0;
+    };
+    let from = oriented_skeleton_sequence(from_sequence, key.from_orient);
+    let to = oriented_skeleton_sequence(to_sequence, key.to_orient);
+    let max_len = max_overlap.min(from.len()).min(to.len());
+    let mut best = 0usize;
+    for len in 1..=max_len {
+        if from[from.len() - len..] == to[..len] {
+            best = len;
+        }
+    }
+    best
+}
+
+fn oriented_skeleton_sequence(sequence: &str, orient: char) -> String {
+    if orient == '+' {
+        sequence.to_string()
+    } else {
+        revcomp_string(sequence)
+    }
+}
+
+fn prune_mito_stable_redundant_links(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> Vec<SkeletonLinkKey> {
+    let mut pruned = Vec::new();
+    loop {
+        let before = mito_stable_topology_stats(config, segments, links);
+        let mut seen = HashSet::new();
+        let mut best: Option<(MitoStableTopologyStats, bool, u32, SkeletonLinkKey)> = None;
+
+        let keys: Vec<_> = links
+            .iter()
+            .filter(|(_, support)| keep_skeleton_link(config, support))
+            .filter_map(|(key, support)| {
+                let physical = canonical_mito_stable_physical_link(key);
+                if !seen.insert(physical) {
+                    return None;
+                }
+                let support_score = support
+                    .skeleton_support
+                    .max(support.paf_support)
+                    .max(support.rescue_support);
+                Some((key.clone(), support.skeleton_support > 0, support_score))
+            })
+            .collect();
+
+        for (key, has_skeleton_support, support_score) in keys {
+            let mut trial = links.clone();
+            remove_mito_stable_physical_link_pair(&mut trial, &key);
+            refresh_skeleton_link_ratios(config, &mut trial);
+            let after = mito_stable_topology_stats(config, segments, &trial);
+            if !mito_stable_redundant_prune_improves(before, after) {
+                continue;
+            }
+            if !mito_stable_node_constraints_ok_for_transition(
+                config, segments, links, segments, &trial,
+            ) {
+                continue;
+            }
+            let score = (after, has_skeleton_support, support_score, key.clone());
+            if best.as_ref().is_none_or(|old| score < *old) {
+                best = Some(score);
+            }
+        }
+
+        let Some((_, _, _, key)) = best else {
+            break;
+        };
+        remove_mito_stable_physical_link_pair(links, &key);
+        pruned.push(key);
+    }
+    pruned
+}
+
+fn mito_stable_redundant_prune_improves(
+    before: MitoStableTopologyStats,
+    after: MitoStableTopologyStats,
+) -> bool {
+    after.components == before.components
+        && after.open_ends <= before.open_ends
+        && after.endpoint_overload <= before.endpoint_overload
+        && after.unique_links < before.unique_links
+        && after.branch_ends < before.branch_ends
+        && after.cycle_rank < before.cycle_rank
+}
+
+fn canonical_mito_stable_physical_link(key: &SkeletonLinkKey) -> ((String, char), (String, char)) {
+    let left = skeleton_physical_from_end(&key.from, key.from_orient);
+    let right = skeleton_physical_to_end(&key.to, key.to_orient);
+    canonical_physical_end_pair(left, right)
+}
+
+fn canonical_physical_end_pair(
+    left: (String, char),
+    right: (String, char),
+) -> ((String, char), (String, char)) {
+    if left <= right {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
+fn remove_mito_stable_physical_link_pair(
+    links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    key: &SkeletonLinkKey,
+) {
+    let physical = canonical_mito_stable_physical_link(key);
+    links.retain(|candidate, _| canonical_mito_stable_physical_link(candidate) != physical);
+}
+
+fn apply_mito_stable_manual_edits(
+    config: &Config,
+    links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> Vec<MitoStableManualEdit> {
+    let mut edits = Vec::new();
+    for key in &config.mito_stable_drop_links {
+        remove_mito_stable_physical_link_pair(links, key);
+        edits.push(MitoStableManualEdit {
+            action: "drop".to_string(),
+            key: key.clone(),
+        });
+    }
+    for key in &config.mito_stable_force_links {
+        insert_mito_stable_supported_link_pair(
+            config,
+            links,
+            key.clone(),
+            SkeletonLinkSupport {
+                skeleton_support: config.min_link_support,
+                paf_support: config.skeleton_min_link_support,
+                rescue_support: config.skeleton_rescue_link_support,
+                ..SkeletonLinkSupport::default()
+            },
+        );
+        edits.push(MitoStableManualEdit {
+            action: "force".to_string(),
+            key: key.clone(),
+        });
+    }
+    edits
+}
+
+fn analyze_mito_stable_copy_choices(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    base_links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    candidates: &[MitoCompactBridgeCandidate],
+) -> Vec<MitoStableCopyChoiceRow> {
+    let degrees = mito_stable_physical_side_degrees(config, segments, base_links);
+    let mut selected_three_way = if config.mito_stable_selected_nodes.is_empty() {
+        segments
+            .iter()
+            .filter_map(|segment| {
+                let (left, right) = degrees.get(&segment.name).copied().unwrap_or((0, 0));
+                (mito_stable_node_degree_class(left, right) == "three_way")
+                    .then(|| segment.name.clone())
+            })
+            .collect::<Vec<_>>()
+    } else {
+        config
+            .mito_stable_selected_nodes
+            .iter()
+            .filter_map(|segment| {
+                let (left, right) = degrees.get(segment).copied().unwrap_or((0, 0));
+                (mito_stable_node_degree_class(left, right) == "three_way").then(|| segment.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    if selected_three_way.len() < 2 {
+        return Vec::new();
+    }
+    selected_three_way.sort();
+
+    let support_by_physical = mito_stable_candidate_support_by_physical(candidates);
+    let physical_links = mito_stable_kept_physical_links(config, base_links);
+    let mut rows = Vec::new();
+    for left_index in 0..selected_three_way.len() {
+        for right_index in (left_index + 1)..selected_three_way.len() {
+            let node_a = &selected_three_way[left_index];
+            let node_b = &selected_three_way[right_index];
+            let Some((node_a_single, node_a_branch)) =
+                mito_stable_three_way_single_and_branch_sides(&degrees, node_a)
+            else {
+                continue;
+            };
+            let Some((node_b_single, node_b_branch)) =
+                mito_stable_three_way_single_and_branch_sides(&degrees, node_b)
+            else {
+                continue;
+            };
+
+            let double_link = skeleton_link_key_from_physical_ends(
+                (node_a.clone(), node_a_single),
+                (node_b.clone(), node_b_single),
+            );
+            let inferred_double_support = mito_stable_double_copy_bridge_chain_support(
+                config,
+                segments,
+                base_links,
+                &(node_a.clone(), node_a_single),
+                &(node_b.clone(), node_b_single),
+            );
+            rows.push(mito_stable_copy_choice_row(
+                config,
+                segments,
+                base_links,
+                node_a,
+                node_b,
+                "double-copy-add-single-sides",
+                &[],
+                Some(double_link),
+                &support_by_physical,
+                inferred_double_support,
+            ));
+
+            let node_a_branch_links = mito_stable_links_touching_physical_side(
+                &physical_links,
+                &(node_a.clone(), node_a_branch),
+            );
+            let node_b_branch_links = mito_stable_links_touching_physical_side(
+                &physical_links,
+                &(node_b.clone(), node_b_branch),
+            );
+            for remove_a in &node_a_branch_links {
+                for remove_b in &node_b_branch_links {
+                    if canonical_physical_end_pair(remove_a.0.clone(), remove_a.1.clone())
+                        == canonical_physical_end_pair(remove_b.0.clone(), remove_b.1.clone())
+                    {
+                        continue;
+                    }
+                    let Some(free_a) =
+                        other_physical_end(remove_a, &(node_a.clone(), node_a_branch))
+                    else {
+                        continue;
+                    };
+                    let Some(free_b) =
+                        other_physical_end(remove_b, &(node_b.clone(), node_b_branch))
+                    else {
+                        continue;
+                    };
+                    let removed = vec![
+                        skeleton_link_key_from_physical_ends(
+                            remove_a.0.clone(),
+                            remove_a.1.clone(),
+                        ),
+                        skeleton_link_key_from_physical_ends(
+                            remove_b.0.clone(),
+                            remove_b.1.clone(),
+                        ),
+                    ];
+                    let added = skeleton_link_key_from_physical_ends(free_a, free_b);
+                    rows.push(mito_stable_copy_choice_row(
+                        config,
+                        segments,
+                        base_links,
+                        node_a,
+                        node_b,
+                        "single-copy-remove-branches-and-reconnect",
+                        &removed,
+                        Some(added),
+                        &support_by_physical,
+                        None,
+                    ));
+                }
+            }
+        }
+    }
+    rows.sort_by(|left, right| {
+        left.node_a
+            .cmp(&right.node_a)
+            .then_with(|| left.node_b.cmp(&right.node_b))
+            .then_with(|| left.option.cmp(&right.option))
+            .then_with(|| right.added_support.cmp(&left.added_support))
+            .then_with(|| left.added_link.cmp(&right.added_link))
+    });
+    rows
+}
+
+fn select_mito_stable_copy_choice_bridges(
+    config: &Config,
+    base_topology: &MitoStableTopologyStats,
+    rows: &[MitoStableCopyChoiceRow],
+) -> Vec<MitoCompactBridgeCandidate> {
+    if config.mito_stable_selection_mode == MitoStableSelectionMode::AllowSelected {
+        return Vec::new();
+    }
+
+    let min_double_support = config.skeleton_min_link_support.saturating_mul(3).max(30);
+    let mut rows_by_pair: HashMap<(String, String), Vec<&MitoStableCopyChoiceRow>> = HashMap::new();
+    for row in rows {
+        rows_by_pair
+            .entry((row.node_a.clone(), row.node_b.clone()))
+            .or_default()
+            .push(row);
+    }
+
+    let mut candidates = Vec::new();
+    for ((node_a, node_b), pair_rows) in rows_by_pair {
+        let Some(double_row) = pair_rows
+            .iter()
+            .copied()
+            .find(|row| row.option == "double-copy-add-single-sides")
+        else {
+            continue;
+        };
+        let Some(added_link) = double_row.added_link.clone() else {
+            continue;
+        };
+        if double_row.added_support < min_double_support {
+            continue;
+        }
+        if double_row.node_a_class != "2-2" || double_row.node_b_class != "2-2" {
+            continue;
+        }
+        if double_row.components > base_topology.components
+            || double_row.open_ends > base_topology.open_ends
+            || double_row.endpoint_overload > base_topology.endpoint_overload
+        {
+            continue;
+        }
+
+        let max_single_support = pair_rows
+            .iter()
+            .filter(|row| row.option == "single-copy-remove-branches-and-reconnect")
+            .map(|row| row.added_support)
+            .max()
+            .unwrap_or(0);
+        if max_single_support > config.skeleton_min_link_support
+            && double_row.added_support < max_single_support.saturating_mul(3)
+        {
+            continue;
+        }
+
+        candidates.push((
+            double_row.added_support,
+            max_single_support,
+            node_a,
+            node_b,
+            added_link,
+        ));
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| left.4.cmp(&right.4))
+    });
+
+    let mut used_nodes = HashSet::new();
+    let mut seen_physical = HashSet::new();
+    let mut selected = Vec::new();
+    for (support, _max_single_support, node_a, node_b, key) in candidates {
+        if used_nodes.contains(&node_a) || used_nodes.contains(&node_b) {
+            continue;
+        }
+        if !seen_physical.insert(canonical_mito_stable_physical_link(&key)) {
+            continue;
+        }
+        used_nodes.insert(node_a);
+        used_nodes.insert(node_b);
+        selected.push(MitoCompactBridgeCandidate {
+            key,
+            support,
+            source: MitoCompactBridgeSource::CopyChoice,
+        });
+    }
+    selected
+}
+
+fn analyze_mito_stable_selected_nodes(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    base_links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    candidates: &[MitoCompactBridgeCandidate],
+) -> Vec<MitoStableSelectedNodeDiagnostic> {
+    let segment_names = segments
+        .iter()
+        .map(|segment| segment.name.clone())
+        .collect::<HashSet<_>>();
+    let degrees = mito_stable_physical_side_degrees(config, segments, base_links);
+    let physical_links = mito_stable_kept_physical_links(config, base_links);
+    let mut rows = Vec::new();
+    let mut selected = config
+        .mito_stable_selected_nodes
+        .iter()
+        .filter(|segment| segment_names.contains(*segment))
+        .cloned()
+        .collect::<Vec<_>>();
+    selected.sort();
+    for segment in selected {
+        let (left_degree, right_degree) = degrees.get(&segment).copied().unwrap_or((0, 0));
+        let mut incident_base_links = physical_links
+            .iter()
+            .filter(|(left, right)| left.0 == segment || right.0 == segment)
+            .map(|(left, right)| format_physical_link(left, right))
+            .collect::<Vec<_>>();
+        incident_base_links.sort();
+
+        let mut incident_candidates = candidates
+            .iter()
+            .filter(|candidate| candidate.key.from == segment || candidate.key.to == segment)
+            .map(|candidate| {
+                format!(
+                    "{}:{}",
+                    format_skeleton_link_key(&candidate.key),
+                    candidate.support
+                )
+            })
+            .collect::<Vec<_>>();
+        incident_candidates.sort();
+
+        rows.push(MitoStableSelectedNodeDiagnostic {
+            segment,
+            left_degree,
+            right_degree,
+            class: mito_stable_node_degree_class(left_degree, right_degree),
+            selected: true,
+            mode: config.mito_stable_selection_mode.as_str().to_string(),
+            incident_base_links,
+            incident_candidates,
+        });
+    }
+    rows
+}
+
+fn mito_stable_copy_choice_row(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    base_links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    node_a: &str,
+    node_b: &str,
+    option: &str,
+    removed_links: &[SkeletonLinkKey],
+    added_link: Option<SkeletonLinkKey>,
+    support_by_physical: &HashMap<((String, char), (String, char)), u32>,
+    inferred_added_support: Option<(u32, String)>,
+) -> MitoStableCopyChoiceRow {
+    let direct_support = added_link
+        .as_ref()
+        .and_then(|key| {
+            support_by_physical
+                .get(&canonical_mito_stable_physical_link(key))
+                .copied()
+        })
+        .unwrap_or(0);
+    let inferred_support = inferred_added_support
+        .as_ref()
+        .map(|(support, _)| *support)
+        .unwrap_or(0);
+    let added_support = direct_support.max(inferred_support);
+    let added_support_source = match inferred_added_support {
+        Some((support, source)) if support > direct_support => source,
+        _ if direct_support > 0 => "read_walk".to_string(),
+        _ => ".".to_string(),
+    };
+
+    let mut trial = base_links.clone();
+    for key in removed_links {
+        remove_mito_stable_physical_link_pair(&mut trial, key);
+    }
+    if let Some(key) = &added_link {
+        insert_mito_stable_supported_link_pair(
+            config,
+            &mut trial,
+            key.clone(),
+            SkeletonLinkSupport {
+                skeleton_support: config.min_link_support,
+                paf_support: added_support,
+                ..SkeletonLinkSupport::default()
+            },
+        );
+    }
+    refresh_skeleton_link_ratios(config, &mut trial);
+    let topology = mito_stable_topology_stats(config, segments, &trial);
+    let degrees = mito_stable_physical_side_degrees(config, segments, &trial);
+    let (node_a_left, node_a_right) = degrees.get(node_a).copied().unwrap_or((0, 0));
+    let (node_b_left, node_b_right) = degrees.get(node_b).copied().unwrap_or((0, 0));
+    let node_a_class = mito_stable_node_degree_class(node_a_left, node_a_right);
+    let node_b_class = mito_stable_node_degree_class(node_b_left, node_b_right);
+    let interpretation = if option.starts_with("double-copy") {
+        if added_support >= config.skeleton_min_link_support {
+            "read_supported_double_copy_bridge"
+        } else {
+            "weak_double_copy_bridge"
+        }
+    } else if added_support <= 1 {
+        "weak_single_copy_reconnect"
+    } else if added_support >= config.skeleton_min_link_support {
+        "read_supported_single_copy_reconnect"
+    } else {
+        "low_support_single_copy_reconnect"
+    }
+    .to_string();
+    MitoStableCopyChoiceRow {
+        node_a: node_a.to_string(),
+        node_b: node_b.to_string(),
+        option: option.to_string(),
+        removed_links: removed_links.to_vec(),
+        added_link,
+        added_support,
+        added_support_source,
+        components: topology.components,
+        open_ends: topology.open_ends,
+        endpoint_overload: topology.endpoint_overload,
+        branch_ends: topology.branch_ends,
+        cycle_rank: topology.cycle_rank,
+        node_a_class,
+        node_b_class,
+        interpretation,
+    }
+}
+
+fn mito_stable_three_way_single_and_branch_sides(
+    degrees: &HashMap<String, (usize, usize)>,
+    segment: &str,
+) -> Option<(char, char)> {
+    let (left, right) = degrees.get(segment).copied().unwrap_or((0, 0));
+    match (left, right) {
+        (1, 2) => Some(('L', 'R')),
+        (2, 1) => Some(('R', 'L')),
+        _ => None,
+    }
+}
+
+fn mito_stable_candidate_support_by_physical(
+    candidates: &[MitoCompactBridgeCandidate],
+) -> HashMap<((String, char), (String, char)), u32> {
+    let mut support: HashMap<((String, char), (String, char)), u32> = HashMap::new();
+    for candidate in candidates {
+        support
+            .entry(canonical_mito_stable_physical_link(&candidate.key))
+            .and_modify(|value| *value = (*value).max(candidate.support))
+            .or_insert(candidate.support);
+    }
+    support
+}
+
+fn mito_stable_double_copy_bridge_chain_support(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    left_end: &(String, char),
+    right_end: &(String, char),
+) -> Option<(u32, String)> {
+    let degrees = mito_stable_physical_side_degrees(config, segments, links);
+    let lengths: HashMap<String, usize> = segments
+        .iter()
+        .map(|segment| (segment.name.clone(), segment.sequence.len()))
+        .collect();
+    let physical_support = mito_stable_kept_physical_link_support_scores(config, links);
+    let left_links =
+        mito_stable_supported_links_touching_physical_side(&physical_support, left_end);
+    let right_links =
+        mito_stable_supported_links_touching_physical_side(&physical_support, right_end);
+    let max_bridge_len = mito_stable_small_repeat_bridge_max_len(config);
+    let mut best: Option<(u32, String, String)> = None;
+
+    for (left_physical, left_support) in &left_links {
+        let Some(left_bridge_end) = other_physical_end(left_physical, left_end) else {
+            continue;
+        };
+        let bridge = left_bridge_end.0.clone();
+        if bridge == left_end.0 || bridge == right_end.0 {
+            continue;
+        }
+        let (bridge_left_degree, bridge_right_degree) =
+            degrees.get(&bridge).copied().unwrap_or((0, 0));
+        if mito_stable_node_degree_class(bridge_left_degree, bridge_right_degree) != "2-2" {
+            continue;
+        }
+        if lengths.get(&bridge).copied().unwrap_or(usize::MAX) > max_bridge_len {
+            continue;
+        }
+
+        for (right_physical, right_support) in &right_links {
+            let Some(right_bridge_end) = other_physical_end(right_physical, right_end) else {
+                continue;
+            };
+            if right_bridge_end.0 != bridge || right_bridge_end.1 == left_bridge_end.1 {
+                continue;
+            }
+            let support = (*left_support).min(*right_support);
+            let source = format!(
+                "bridge_chain:{}:{}:{}",
+                bridge,
+                format_physical_link(&left_physical.0, &left_physical.1),
+                format_physical_link(&right_physical.0, &right_physical.1)
+            );
+            let score = (support, bridge.clone(), source);
+            if best.as_ref().is_none_or(|old| score > *old) {
+                best = Some(score);
+            }
+        }
+    }
+
+    best.map(|(support, _bridge, source)| (support, source))
+}
+
+fn mito_stable_kept_physical_link_support_scores(
+    config: &Config,
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> HashMap<((String, char), (String, char)), u32> {
+    let mut support_by_physical: HashMap<((String, char), (String, char)), u32> = HashMap::new();
+    for (key, support) in links {
+        if !keep_skeleton_link(config, support) {
+            continue;
+        }
+        let score = mito_stable_link_support_score(support);
+        support_by_physical
+            .entry(canonical_mito_stable_physical_link(key))
+            .and_modify(|old| *old = (*old).max(score))
+            .or_insert(score);
+    }
+    support_by_physical
+}
+
+fn mito_stable_supported_links_touching_physical_side(
+    physical_support: &HashMap<((String, char), (String, char)), u32>,
+    endpoint: &(String, char),
+) -> Vec<(((String, char), (String, char)), u32)> {
+    physical_support
+        .iter()
+        .filter(|((left, right), _)| left == endpoint || right == endpoint)
+        .map(|(physical, support)| (physical.clone(), *support))
+        .collect()
+}
+
+fn mito_stable_link_support_score(support: &SkeletonLinkSupport) -> u32 {
+    support
+        .skeleton_support
+        .max(support.paf_support)
+        .max(support.rescue_support)
+}
+
+fn mito_stable_kept_physical_links(
+    config: &Config,
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> Vec<((String, char), (String, char))> {
+    let mut seen = HashSet::new();
+    let mut physical_links = Vec::new();
+    for (key, support) in links {
+        if !keep_skeleton_link(config, support) {
+            continue;
+        }
+        let physical = canonical_mito_stable_physical_link(key);
+        if seen.insert(physical.clone()) {
+            physical_links.push(physical);
+        }
+    }
+    physical_links.sort();
+    physical_links
+}
+
+fn mito_stable_links_touching_physical_side(
+    physical_links: &[((String, char), (String, char))],
+    endpoint: &(String, char),
+) -> Vec<((String, char), (String, char))> {
+    physical_links
+        .iter()
+        .filter(|(left, right)| left == endpoint || right == endpoint)
+        .cloned()
+        .collect()
+}
+
+fn other_physical_end(
+    physical_link: &((String, char), (String, char)),
+    endpoint: &(String, char),
+) -> Option<(String, char)> {
+    if &physical_link.0 == endpoint {
+        Some(physical_link.1.clone())
+    } else if &physical_link.1 == endpoint {
+        Some(physical_link.0.clone())
+    } else {
+        None
+    }
+}
+
+fn skeleton_link_key_from_physical_ends(
+    from_end: (String, char),
+    to_end: (String, char),
+) -> SkeletonLinkKey {
+    SkeletonLinkKey {
+        from: from_end.0,
+        from_orient: if from_end.1 == 'R' { '+' } else { '-' },
+        to: to_end.0,
+        to_orient: if to_end.1 == 'L' { '+' } else { '-' },
+    }
+}
+
+fn skeleton_physical_from_end(segment: &str, orient: char) -> (String, char) {
+    (segment.to_string(), if orient == '+' { 'R' } else { 'L' })
+}
+
+fn skeleton_physical_to_end(segment: &str, orient: char) -> (String, char) {
+    (segment.to_string(), if orient == '+' { 'L' } else { 'R' })
 }
 
 fn read_skeleton_gfa(
@@ -3963,7 +6577,9 @@ fn complete_mito_compact_links(
 
 fn mito_compact_candidate_min_support(config: &Config, source: MitoCompactBridgeSource) -> u32 {
     match source {
-        MitoCompactBridgeSource::LocalPaf => config.skeleton_min_link_support,
+        MitoCompactBridgeSource::LocalPaf | MitoCompactBridgeSource::CopyChoice => {
+            config.skeleton_min_link_support
+        }
         MitoCompactBridgeSource::Rescue => config.skeleton_rescue_link_support,
     }
 }
@@ -4130,7 +6746,7 @@ fn insert_mito_compact_bridge_key(
 ) {
     let entry = links.entry(key.clone()).or_default();
     match source {
-        MitoCompactBridgeSource::LocalPaf => {
+        MitoCompactBridgeSource::LocalPaf | MitoCompactBridgeSource::CopyChoice => {
             entry.paf_support = entry.paf_support.max(support);
         }
         MitoCompactBridgeSource::Rescue => {
@@ -4475,6 +7091,622 @@ fn write_mito_compact_bridge_report(
     }
     for segment in &report.pruned_segments {
         writeln!(pruned_out, "segment\t{segment}\t.\t.\t.")?;
+    }
+    Ok(())
+}
+
+fn write_mito_stable_bridge_report(
+    config: &Config,
+    initial: &MitoStableTopologyStats,
+    final_stats: &MitoStableTopologyStats,
+    candidates: &[MitoCompactBridgeCandidate],
+    all_candidate_count: usize,
+    auto_copy_choice_bridges: &[MitoCompactBridgeCandidate],
+    selected: &[MitoCompactBridgeCandidate],
+    pruned_links: &[SkeletonLinkKey],
+    repeat_expansions: &[MitoStableRepeatExpansion],
+    manual_edits: &[MitoStableManualEdit],
+    default_node_shape_violations: usize,
+    node_constraint_fallback: bool,
+    final_node_shape_violations: usize,
+) -> io::Result<()> {
+    let mut out = File::create(config.out_dir.join("mito_stable_bridge.report.txt"))?;
+    writeln!(out, "mito_stable_bridge_report")?;
+    writeln!(out, "mode\tglobal_candidate_selection")?;
+    writeln!(
+        out,
+        "mx_mode\t{}",
+        config.mito_stable_selection_mode.as_str()
+    )?;
+    let mut selected_nodes = config
+        .mito_stable_selected_nodes
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    selected_nodes.sort();
+    writeln!(
+        out,
+        "selected_nodes\t{}",
+        if selected_nodes.is_empty() {
+            ".".to_string()
+        } else {
+            join_string_list(&selected_nodes)
+        }
+    )?;
+    writeln!(
+        out,
+        "node_constraints_explicit\t{}",
+        mito_stable_has_explicit_three_way_constraints(config)
+    )?;
+    writeln!(
+        out,
+        "default_node_shape_violations\t{}",
+        default_node_shape_violations
+    )?;
+    writeln!(
+        out,
+        "node_constraint_fallback\t{}",
+        node_constraint_fallback
+    )?;
+    writeln!(
+        out,
+        "final_node_shape_violations\t{}",
+        final_node_shape_violations
+    )?;
+    writeln!(out, "initial_components\t{}", initial.components)?;
+    writeln!(out, "initial_open_ends\t{}", initial.open_ends)?;
+    writeln!(
+        out,
+        "initial_endpoint_overload\t{}",
+        initial.endpoint_overload
+    )?;
+    writeln!(out, "initial_unique_links\t{}", initial.unique_links)?;
+    writeln!(out, "initial_branch_ends\t{}", initial.branch_ends)?;
+    writeln!(out, "initial_cycle_rank\t{}", initial.cycle_rank)?;
+    writeln!(out, "all_candidates\t{}", all_candidate_count)?;
+    writeln!(out, "candidates\t{}", candidates.len())?;
+    writeln!(
+        out,
+        "auto_copy_choice_bridges\t{}",
+        auto_copy_choice_bridges.len()
+    )?;
+    writeln!(out, "selected_bridges\t{}", selected.len())?;
+    writeln!(
+        out,
+        "manual_forced_links\t{}",
+        manual_edits
+            .iter()
+            .filter(|edit| edit.action == "force")
+            .count()
+    )?;
+    writeln!(
+        out,
+        "manual_dropped_links\t{}",
+        manual_edits
+            .iter()
+            .filter(|edit| edit.action == "drop")
+            .count()
+    )?;
+    writeln!(out, "repeat_expansions\t{}", repeat_expansions.len())?;
+    writeln!(out, "pruned_redundant_links\t{}", pruned_links.len())?;
+    writeln!(out, "final_components\t{}", final_stats.components)?;
+    writeln!(out, "final_open_ends\t{}", final_stats.open_ends)?;
+    writeln!(
+        out,
+        "final_endpoint_overload\t{}",
+        final_stats.endpoint_overload
+    )?;
+    writeln!(out, "final_unique_links\t{}", final_stats.unique_links)?;
+    writeln!(out, "final_branch_ends\t{}", final_stats.branch_ends)?;
+    writeln!(out, "final_cycle_rank\t{}", final_stats.cycle_rank)?;
+
+    let mut candidate_out = File::create(config.out_dir.join("mito_stable_bridge.candidates.tsv"))?;
+    writeln!(
+        candidate_out,
+        "selected\tfrom\tfrom_orient\tto\tto_orient\tsource\tsupport"
+    )?;
+    let selected_keys: HashSet<_> = selected
+        .iter()
+        .map(|candidate| canonical_skeleton_link_key(&candidate.key))
+        .collect();
+    for candidate in candidates {
+        let key = &candidate.key;
+        let selected = selected_keys.contains(&canonical_skeleton_link_key(key));
+        writeln!(
+            candidate_out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            selected,
+            key.from,
+            key.from_orient,
+            key.to,
+            key.to_orient,
+            candidate.source.label(),
+            candidate.support
+        )?;
+    }
+
+    let mut selected_out = File::create(config.out_dir.join("mito_stable_bridge.selected.tsv"))?;
+    writeln!(
+        selected_out,
+        "from\tfrom_orient\tto\tto_orient\tsource\tsupport"
+    )?;
+    for candidate in selected {
+        let key = &candidate.key;
+        writeln!(
+            selected_out,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            key.from,
+            key.from_orient,
+            key.to,
+            key.to_orient,
+            candidate.source.label(),
+            candidate.support
+        )?;
+    }
+    Ok(())
+}
+
+fn write_mito_stable_repeat_expansions(
+    config: &Config,
+    expansions: &[MitoStableRepeatExpansion],
+) -> io::Result<()> {
+    let mut out = File::create(config.out_dir.join("mito_stable_repeat_expansions.tsv"))?;
+    writeln!(
+        out,
+        "template\tclone\tremoved_from\tremoved_from_orient\tremoved_to\tremoved_to_orient\tleft_from\tleft_from_orient\tleft_to\tleft_to_orient\tright_from\tright_from_orient\tright_to\tright_to_orient\tshortcut_overlap\tleft_overlap\tright_overlap\tsupport"
+    )?;
+    for expansion in expansions {
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            expansion.template,
+            expansion.clone,
+            expansion.removed_shortcut.from,
+            expansion.removed_shortcut.from_orient,
+            expansion.removed_shortcut.to,
+            expansion.removed_shortcut.to_orient,
+            expansion.left_link.from,
+            expansion.left_link.from_orient,
+            expansion.left_link.to,
+            expansion.left_link.to_orient,
+            expansion.right_link.from,
+            expansion.right_link.from_orient,
+            expansion.right_link.to,
+            expansion.right_link.to_orient,
+            expansion.shortcut_overlap,
+            expansion.left_overlap,
+            expansion.right_overlap,
+            expansion.support
+        )?;
+    }
+    Ok(())
+}
+
+fn write_mito_stable_pruned_links(
+    config: &Config,
+    pruned_links: &[SkeletonLinkKey],
+) -> io::Result<()> {
+    let mut out = File::create(config.out_dir.join("mito_stable_pruned.tsv"))?;
+    writeln!(out, "from\tfrom_orient\tto\tto_orient")?;
+    for key in pruned_links {
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}",
+            key.from, key.from_orient, key.to, key.to_orient
+        )?;
+    }
+    Ok(())
+}
+
+fn write_mito_stable_manual_edits(
+    config: &Config,
+    manual_edits: &[MitoStableManualEdit],
+) -> io::Result<()> {
+    let mut out = File::create(config.out_dir.join("mito_stable_manual_edits.tsv"))?;
+    writeln!(out, "action\tfrom\tfrom_orient\tto\tto_orient")?;
+    for edit in manual_edits {
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}",
+            edit.action, edit.key.from, edit.key.from_orient, edit.key.to, edit.key.to_orient
+        )?;
+    }
+    Ok(())
+}
+
+fn write_mito_stable_copy_choices(
+    config: &Config,
+    rows: &[MitoStableCopyChoiceRow],
+) -> io::Result<()> {
+    let mut out = File::create(config.out_dir.join("mito_stable_copy_choice.tsv"))?;
+    writeln!(
+        out,
+        "node_a\tnode_b\toption\tremoved_links\tadded_link\tadded_support\tsupport_source\tcomponents\topen_ends\tendpoint_overload\tbranch_ends\tcycle_rank\tnode_a_class\tnode_b_class\tinterpretation"
+    )?;
+    for row in rows {
+        let removed_links = if row.removed_links.is_empty() {
+            ".".to_string()
+        } else {
+            row.removed_links
+                .iter()
+                .map(format_skeleton_link_key)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let added_link = row
+            .added_link
+            .as_ref()
+            .map(format_skeleton_link_key)
+            .unwrap_or_else(|| ".".to_string());
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            row.node_a,
+            row.node_b,
+            row.option,
+            removed_links,
+            added_link,
+            row.added_support,
+            row.added_support_source,
+            row.components,
+            row.open_ends,
+            row.endpoint_overload,
+            row.branch_ends,
+            row.cycle_rank,
+            row.node_a_class,
+            row.node_b_class,
+            row.interpretation
+        )?;
+    }
+    Ok(())
+}
+
+fn write_mito_stable_selected_node_diagnostics(
+    config: &Config,
+    rows: &[MitoStableSelectedNodeDiagnostic],
+) -> io::Result<()> {
+    let mut out = File::create(config.out_dir.join("mito_stable_selected_nodes.tsv"))?;
+    writeln!(
+        out,
+        "segment\tselected\tmode\tleft_degree\tright_degree\tclass\tincident_base_links\tincident_candidates"
+    )?;
+    for row in rows {
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            row.segment,
+            row.selected,
+            row.mode,
+            row.left_degree,
+            row.right_degree,
+            row.class,
+            if row.incident_base_links.is_empty() {
+                ".".to_string()
+            } else {
+                join_string_list(&row.incident_base_links)
+            },
+            if row.incident_candidates.is_empty() {
+                ".".to_string()
+            } else {
+                join_string_list(&row.incident_candidates)
+            }
+        )?;
+    }
+    Ok(())
+}
+
+fn write_mito_stable_node_degrees(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> io::Result<()> {
+    let degrees = mito_stable_physical_side_degrees(config, segments, links);
+    let mut out = File::create(config.out_dir.join("mito_stable_node_degrees.tsv"))?;
+    writeln!(out, "segment\tleft_degree\tright_degree\tclass")?;
+    let mut rows: Vec<_> = degrees.into_iter().collect();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    for (segment, (left_degree, right_degree)) in rows {
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}",
+            segment,
+            left_degree,
+            right_degree,
+            mito_stable_node_degree_class(left_degree, right_degree)
+        )?;
+    }
+    Ok(())
+}
+
+fn write_mito_stable_node_repairs(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    before_links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    after_links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+    selected: &[MitoCompactBridgeCandidate],
+    manual_edits: &[MitoStableManualEdit],
+    pruned_links: &[SkeletonLinkKey],
+    repeat_expansions: &[MitoStableRepeatExpansion],
+) -> io::Result<()> {
+    let before = mito_stable_physical_side_degrees(config, segments, before_links);
+    let after = mito_stable_physical_side_degrees(config, segments, after_links);
+    let mut events: HashMap<String, Vec<String>> = HashMap::new();
+
+    for candidate in selected {
+        let event = format!(
+            "selected_bridge:{}:{}:{}:{}:{}",
+            candidate.key.from,
+            candidate.key.from_orient,
+            candidate.key.to,
+            candidate.key.to_orient,
+            candidate.support
+        );
+        record_mito_stable_link_event(&mut events, &candidate.key, event);
+    }
+    for edit in manual_edits {
+        let event = format!(
+            "manual_{}:{}",
+            edit.action,
+            format_skeleton_link_key(&edit.key)
+        );
+        record_mito_stable_link_event(&mut events, &edit.key, event);
+    }
+    for key in pruned_links {
+        let event = format!("pruned:{}", format_skeleton_link_key(key));
+        record_mito_stable_link_event(&mut events, key, event);
+    }
+    for expansion in repeat_expansions {
+        events
+            .entry(expansion.template.clone())
+            .or_default()
+            .push(format!(
+                "repeat_expansion_template:{}",
+                format_skeleton_link_key(&expansion.removed_shortcut)
+            ));
+        events
+            .entry(expansion.clone.clone())
+            .or_default()
+            .push(format!(
+                "repeat_expansion_clone:{}:{}",
+                expansion.template, expansion.support
+            ));
+    }
+
+    let mut out = File::create(config.out_dir.join("mito_stable_node_repairs.tsv"))?;
+    writeln!(
+        out,
+        "segment\tbefore_left\tbefore_right\tbefore_class\tafter_left\tafter_right\tafter_class\trepair_events"
+    )?;
+    let mut sorted_segments = segments.to_vec();
+    sorted_segments.sort_by(|left, right| left.name.cmp(&right.name));
+    for segment in sorted_segments {
+        let (before_left, before_right) = before.get(&segment.name).copied().unwrap_or((0, 0));
+        let (after_left, after_right) = after.get(&segment.name).copied().unwrap_or((0, 0));
+        let mut node_events = events.remove(&segment.name).unwrap_or_default();
+        node_events.sort();
+        node_events.dedup();
+        if before_left == after_left && before_right == after_right && node_events.is_empty() {
+            continue;
+        }
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            segment.name,
+            before_left,
+            before_right,
+            mito_stable_node_degree_class(before_left, before_right),
+            after_left,
+            after_right,
+            mito_stable_node_degree_class(after_left, after_right),
+            if node_events.is_empty() {
+                ".".to_string()
+            } else {
+                join_string_list(&node_events)
+            }
+        )?;
+    }
+    Ok(())
+}
+
+fn record_mito_stable_link_event(
+    events: &mut HashMap<String, Vec<String>>,
+    key: &SkeletonLinkKey,
+    event: String,
+) {
+    events
+        .entry(key.from.clone())
+        .or_default()
+        .push(event.clone());
+    events.entry(key.to.clone()).or_default().push(event);
+}
+
+fn format_skeleton_link_key(key: &SkeletonLinkKey) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        key.from, key.from_orient, key.to, key.to_orient
+    )
+}
+
+fn format_physical_link(left: &(String, char), right: &(String, char)) -> String {
+    format!("{}:{}--{}:{}", left.0, left.1, right.0, right.1)
+}
+
+fn write_mito_stable_topology_scan(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> io::Result<()> {
+    let degrees = mito_stable_physical_side_degrees(config, segments, links);
+    let adjacency = mito_stable_segment_adjacency(config, segments, links);
+    let merge_evidence = mito_stable_three_way_merge_evidence(config, segments, links);
+    let bridge_evidence = mito_stable_small_repeat_bridge_evidence(config, segments, links);
+    let mut out = File::create(config.out_dir.join("mito_stable_topology_scan.tsv"))?;
+    writeln!(
+        out,
+        "segment\tlength\tleft_degree\tright_degree\tclass\tauto_role\tevidence\tneighbors"
+    )?;
+    let mut sorted_segments = segments.to_vec();
+    sorted_segments.sort_by(|left, right| left.name.cmp(&right.name));
+    for segment in sorted_segments {
+        let (left_degree, right_degree) = degrees.get(&segment.name).copied().unwrap_or((0, 0));
+        let class = mito_stable_node_degree_class(left_degree, right_degree);
+        let mut neighbors = adjacency
+            .get(&segment.name)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        neighbors.sort();
+        let (auto_role, evidence) = if let Some(evidence) = merge_evidence.get(&segment.name) {
+            (
+                "accepted_three_way_merge_candidate",
+                join_string_list(evidence),
+            )
+        } else if let Some(evidence) = bridge_evidence.get(&segment.name) {
+            ("small_2_2_repeat_bridge", join_string_list(evidence))
+        } else {
+            match class {
+                "three_way" => ("unresolved_three_way", ".".to_string()),
+                "2-2" => ("repeat_2_2", ".".to_string()),
+                "1-1" => ("linear", ".".to_string()),
+                _ => ("invalid_shape", ".".to_string()),
+            }
+        };
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            segment.name,
+            segment.sequence.len(),
+            left_degree,
+            right_degree,
+            class,
+            auto_role,
+            evidence,
+            join_string_list(&neighbors)
+        )?;
+    }
+    Ok(())
+}
+
+fn mito_stable_segment_adjacency(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> HashMap<String, HashSet<String>> {
+    let segment_names: HashSet<_> = segments
+        .iter()
+        .map(|segment| segment.name.clone())
+        .collect();
+    let mut adjacency: HashMap<String, HashSet<String>> = segments
+        .iter()
+        .map(|segment| (segment.name.clone(), HashSet::new()))
+        .collect();
+    let mut seen = HashSet::new();
+    for (key, support) in links {
+        if !keep_skeleton_link(config, support) {
+            continue;
+        }
+        if !segment_names.contains(&key.from) || !segment_names.contains(&key.to) {
+            continue;
+        }
+        let physical = canonical_mito_stable_physical_link(key);
+        if !seen.insert(physical) {
+            continue;
+        }
+        adjacency
+            .entry(key.from.clone())
+            .or_default()
+            .insert(key.to.clone());
+        adjacency
+            .entry(key.to.clone())
+            .or_default()
+            .insert(key.from.clone());
+    }
+    adjacency
+}
+
+fn mito_stable_three_way_merge_evidence(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> HashMap<String, Vec<String>> {
+    let bridge_evidence = mito_stable_small_repeat_bridge_evidence(config, segments, links);
+    let mut evidence: HashMap<String, Vec<String>> = HashMap::new();
+    for (bridge, three_way_neighbors) in bridge_evidence {
+        for three_way in &three_way_neighbors {
+            let partners = three_way_neighbors
+                .iter()
+                .filter(|partner| *partner != three_way)
+                .cloned()
+                .collect::<Vec<_>>();
+            if partners.is_empty() {
+                continue;
+            }
+            evidence.entry(three_way.clone()).or_default().push(format!(
+                "bridge={bridge};partners={}",
+                join_string_list(&partners)
+            ));
+        }
+    }
+    for values in evidence.values_mut() {
+        values.sort();
+        values.dedup();
+    }
+    evidence
+}
+
+fn mito_stable_small_repeat_bridge_evidence(
+    config: &Config,
+    segments: &[SkeletonSegment],
+    links: &HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+) -> HashMap<String, Vec<String>> {
+    let degrees = mito_stable_physical_side_degrees(config, segments, links);
+    let adjacency = mito_stable_segment_adjacency(config, segments, links);
+    let lengths: HashMap<String, usize> = segments
+        .iter()
+        .map(|segment| (segment.name.clone(), segment.sequence.len()))
+        .collect();
+    let max_bridge_len = mito_stable_small_repeat_bridge_max_len(config);
+    let mut evidence = HashMap::new();
+    for segment in segments {
+        let (left_degree, right_degree) = degrees.get(&segment.name).copied().unwrap_or((0, 0));
+        if mito_stable_node_degree_class(left_degree, right_degree) != "2-2" {
+            continue;
+        }
+        if lengths.get(&segment.name).copied().unwrap_or(usize::MAX) > max_bridge_len {
+            continue;
+        }
+        let mut three_way_neighbors = adjacency
+            .get(&segment.name)
+            .into_iter()
+            .flat_map(|neighbors| neighbors.iter())
+            .filter_map(|neighbor| {
+                let (left_degree, right_degree) = degrees.get(neighbor).copied().unwrap_or((0, 0));
+                (mito_stable_node_degree_class(left_degree, right_degree) == "three_way")
+                    .then(|| neighbor.clone())
+            })
+            .collect::<Vec<_>>();
+        three_way_neighbors.sort();
+        three_way_neighbors.dedup();
+        if three_way_neighbors.len() >= 2 {
+            evidence.insert(segment.name.clone(), three_way_neighbors);
+        }
+    }
+    evidence
+}
+
+fn mito_stable_small_repeat_bridge_max_len(config: &Config) -> usize {
+    config.min_tip_len.max(5_000)
+}
+
+fn write_mito_stable_split_report(
+    config: &Config,
+    split_report: &[MitoStableSplitReportRow],
+) -> io::Result<()> {
+    let mut out = File::create(config.out_dir.join("mito_stable_splits.tsv"))?;
+    writeln!(out, "segment\tposition\tsupport")?;
+    for row in split_report {
+        writeln!(out, "{}\t{}\t{}", row.segment, row.position, row.support)?;
     }
     Ok(())
 }
@@ -5226,6 +8458,71 @@ mod tests {
     }
 
     #[test]
+    fn parses_mito_stable_three_way_node_constraints() {
+        let config = Config::from_args(
+            [
+                "simple_draft_asm",
+                "-p",
+                "mx",
+                "-i",
+                "reads.fastq.gz",
+                "--mx-mode",
+                "forbid-selected",
+                "--selected-nodes=edge_12,edge_17",
+            ]
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.mito_stable_selection_mode,
+            MitoStableSelectionMode::ForbidSelected
+        );
+        assert_eq!(
+            config.mito_stable_selected_nodes,
+            HashSet::from(["edge_12".to_string(), "edge_17".to_string()])
+        );
+        assert!(config.mito_stable_allow_three_way.is_empty());
+        assert_eq!(
+            config.mito_stable_forbid_three_way,
+            HashSet::from(["edge_12".to_string(), "edge_17".to_string()])
+        );
+    }
+
+    #[test]
+    fn parses_mito_stable_allow_selected_as_analysis_mode() {
+        let config = Config::from_args(
+            [
+                "simple_draft_asm",
+                "-p",
+                "mx",
+                "-i",
+                "reads.fastq.gz",
+                "--mx-mode=allow-selected",
+                "--selected-nodes",
+                "edge_4,edge_8",
+            ]
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.mito_stable_selection_mode,
+            MitoStableSelectionMode::AllowSelected
+        );
+        assert_eq!(
+            config.mito_stable_selected_nodes,
+            HashSet::from(["edge_4".to_string(), "edge_8".to_string()])
+        );
+        assert!(config.mito_stable_allow_three_way.is_empty());
+        assert!(config.mito_stable_forbid_three_way.is_empty());
+    }
+
+    #[test]
     fn preset_mito_low_maps_to_compact_mito() {
         let config = Config::from_args(
             ["simple_draft_asm", "-p", "ml", "-i", "reads.fasta.gz"]
@@ -5332,6 +8629,29 @@ mod tests {
 
         assert_eq!(config.read_subsets, vec![ReadSubset { basis_points: 2500 }]);
         assert!((config.min_link_ratio - 0.10).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn preset_mito_stable_uses_complex_repeat_defaults() {
+        let config = Config::from_args(
+            ["simple_draft_asm", "-p", "mx", "-i", "reads.fastq.gz"]
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        )
+        .unwrap();
+
+        assert_eq!(config.organelle, Some(OrganelleProfile::Mito));
+        assert_eq!(config.data_mode, DataMode::Standard);
+        assert!(config.mito_stable);
+        assert_eq!(config.rounds, 2);
+        assert_eq!(config.min_anchor_coverage, 38);
+        assert_eq!(config.min_edge_coverage, 38);
+        assert!((config.min_branch_ratio - 0.48).abs() < f64::EPSILON);
+        assert_eq!(config.skeleton_min_link_support, 10);
+        assert!((config.skeleton_min_link_ratio - 0.08).abs() < f64::EPSILON);
+        assert_eq!(config.skeleton_rescue_link_support, 10);
+        assert!(!config.read_subsets_requested);
     }
 
     #[test]
@@ -5484,6 +8804,474 @@ mod tests {
         );
         assert!(stats.open_out.contains(&("utg1".to_string(), '+')));
         assert!(stats.open_in.contains(&("utg0".to_string(), '+')));
+    }
+
+    #[test]
+    fn mito_stable_prunes_closed_redundant_chord() {
+        let config = Config::from_args(
+            ["simple_draft_asm", "-p", "mx", "-i", "reads.fastq.gz"]
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        )
+        .unwrap();
+        let segments = vec![
+            SkeletonSegment {
+                name: "a".to_string(),
+                sequence: "AAAA".to_string(),
+            },
+            SkeletonSegment {
+                name: "b".to_string(),
+                sequence: "CCCC".to_string(),
+            },
+            SkeletonSegment {
+                name: "c".to_string(),
+                sequence: "GGGG".to_string(),
+            },
+        ];
+        let mut links = HashMap::new();
+        let support = SkeletonLinkSupport {
+            skeleton_support: config.min_link_support,
+            ..SkeletonLinkSupport::default()
+        };
+        for key in [
+            SkeletonLinkKey {
+                from: "a".to_string(),
+                from_orient: '+',
+                to: "b".to_string(),
+                to_orient: '+',
+            },
+            SkeletonLinkKey {
+                from: "b".to_string(),
+                from_orient: '+',
+                to: "c".to_string(),
+                to_orient: '+',
+            },
+            SkeletonLinkKey {
+                from: "c".to_string(),
+                from_orient: '+',
+                to: "a".to_string(),
+                to_orient: '+',
+            },
+            SkeletonLinkKey {
+                from: "a".to_string(),
+                from_orient: '+',
+                to: "c".to_string(),
+                to_orient: '+',
+            },
+        ] {
+            links.insert(key, support.clone());
+        }
+
+        let before = mito_stable_topology_stats(&config, &segments, &links);
+        assert_eq!(before.open_ends, 0);
+        assert_eq!(before.branch_ends, 2);
+        assert_eq!(before.cycle_rank, 2);
+
+        let pruned = prune_mito_stable_redundant_links(&config, &segments, &mut links);
+        let after = mito_stable_topology_stats(&config, &segments, &links);
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].from, "a");
+        assert_eq!(pruned[0].to, "c");
+        assert_eq!(after.open_ends, 0);
+        assert_eq!(after.branch_ends, 0);
+        assert_eq!(after.cycle_rank, 1);
+    }
+
+    #[test]
+    fn mito_stable_bridge_selection_respects_explicit_forbid_three_way() {
+        let config = Config::from_args(
+            ["simple_draft_asm", "-p", "mx", "-i", "reads.fastq.gz"]
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        )
+        .unwrap();
+        let segments = ["a", "b", "c"]
+            .iter()
+            .map(|name| SkeletonSegment {
+                name: (*name).to_string(),
+                sequence: "AAAA".to_string(),
+            })
+            .collect::<Vec<_>>();
+        let support = SkeletonLinkSupport {
+            skeleton_support: config.min_link_support,
+            ..SkeletonLinkSupport::default()
+        };
+        let mut base_links = HashMap::new();
+        for (from, to) in [("a", "b"), ("b", "a")] {
+            insert_mito_stable_supported_link_pair(
+                &config,
+                &mut base_links,
+                SkeletonLinkKey {
+                    from: from.to_string(),
+                    from_orient: '+',
+                    to: to.to_string(),
+                    to_orient: '+',
+                },
+                support.clone(),
+            );
+        }
+        let candidate = MitoCompactBridgeCandidate {
+            key: SkeletonLinkKey {
+                from: "c".to_string(),
+                from_orient: '+',
+                to: "b".to_string(),
+                to_orient: '+',
+            },
+            support: config.skeleton_min_link_support + 1,
+            source: MitoCompactBridgeSource::LocalPaf,
+        };
+
+        let selected = select_mito_stable_bridges(
+            &config,
+            &segments,
+            &base_links,
+            &[candidate.clone()],
+            false,
+        );
+        assert_eq!(selected.len(), 1);
+
+        let mut forbid_config = config.clone();
+        forbid_config
+            .mito_stable_forbid_three_way
+            .insert("b".to_string());
+        let selected_forbidden =
+            select_mito_stable_bridges(&forbid_config, &segments, &base_links, &[candidate], true);
+        assert!(selected_forbidden.is_empty());
+    }
+
+    #[test]
+    fn mito_stable_scan_detects_three_way_merge_candidates() {
+        let config = Config::from_args(
+            ["simple_draft_asm", "-p", "mx", "-i", "reads.fastq.gz"]
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        )
+        .unwrap();
+        let segments = ["t1", "t2", "bridge", "x", "y", "z", "w", "p", "q"]
+            .iter()
+            .map(|name| SkeletonSegment {
+                name: (*name).to_string(),
+                sequence: "AAAA".to_string(),
+            })
+            .collect::<Vec<_>>();
+        let mut links = HashMap::new();
+        let support = SkeletonLinkSupport {
+            skeleton_support: config.min_link_support,
+            ..SkeletonLinkSupport::default()
+        };
+        let add = |links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+                   from: &str,
+                   from_orient: char,
+                   to: &str,
+                   to_orient: char| {
+            insert_mito_stable_supported_link_pair(
+                &config,
+                links,
+                SkeletonLinkKey {
+                    from: from.to_string(),
+                    from_orient,
+                    to: to.to_string(),
+                    to_orient,
+                },
+                support.clone(),
+            );
+        };
+        for (from, from_orient, to, to_orient) in [
+            ("t1", '+', "bridge", '+'),
+            ("x", '+', "t1", '+'),
+            ("y", '+', "t1", '+'),
+            ("t2", '+', "bridge", '-'),
+            ("z", '+', "t2", '+'),
+            ("w", '+', "t2", '+'),
+            ("p", '+', "bridge", '+'),
+            ("q", '+', "bridge", '-'),
+        ] {
+            add(&mut links, from, from_orient, to, to_orient);
+        }
+
+        let degrees = mito_stable_physical_side_degrees(&config, &segments, &links);
+        assert_eq!(
+            mito_stable_node_degree_class(degrees["bridge"].0, degrees["bridge"].1),
+            "2-2"
+        );
+        assert_eq!(
+            mito_stable_node_degree_class(degrees["t1"].0, degrees["t1"].1),
+            "three_way"
+        );
+        assert_eq!(
+            mito_stable_node_degree_class(degrees["t2"].0, degrees["t2"].1),
+            "three_way"
+        );
+
+        let bridge_evidence = mito_stable_small_repeat_bridge_evidence(&config, &segments, &links);
+        assert_eq!(
+            bridge_evidence.get("bridge").cloned().unwrap_or_default(),
+            vec!["t1".to_string(), "t2".to_string()]
+        );
+        let merge_evidence = mito_stable_three_way_merge_evidence(&config, &segments, &links);
+        assert!(merge_evidence
+            .get("t1")
+            .is_some_and(|evidence| evidence.iter().any(|entry| entry.contains("bridge=bridge"))));
+        assert!(merge_evidence
+            .get("t2")
+            .is_some_and(|evidence| evidence.iter().any(|entry| entry.contains("bridge=bridge"))));
+    }
+
+    #[test]
+    fn mito_stable_expands_low_overlap_repeat_shortcut_when_node_class_is_stable() {
+        let config = Config::from_args(
+            ["simple_draft_asm", "-p", "mx", "-i", "reads.fastq.gz"]
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        )
+        .unwrap();
+        let mut segments = vec![
+            SkeletonSegment {
+                name: "a".to_string(),
+                sequence: format!("{}{}", "G".repeat(20), "A".repeat(120)),
+            },
+            SkeletonSegment {
+                name: "b".to_string(),
+                sequence: format!("{}{}", "A".repeat(120), "C".repeat(120)),
+            },
+            SkeletonSegment {
+                name: "c".to_string(),
+                sequence: format!("{}{}", "C".repeat(120), "T".repeat(20)),
+            },
+            SkeletonSegment {
+                name: "d".to_string(),
+                sequence: format!("{}{}", "C".repeat(120), "G".repeat(20)),
+            },
+        ];
+        let key_ab = SkeletonLinkKey {
+            from: "a".to_string(),
+            from_orient: '+',
+            to: "b".to_string(),
+            to_orient: '+',
+        };
+        let key_ac = SkeletonLinkKey {
+            from: "a".to_string(),
+            from_orient: '+',
+            to: "c".to_string(),
+            to_orient: '+',
+        };
+        let key_bc = SkeletonLinkKey {
+            from: "b".to_string(),
+            from_orient: '+',
+            to: "c".to_string(),
+            to_orient: '+',
+        };
+        let key_db = SkeletonLinkKey {
+            from: "d".to_string(),
+            from_orient: '+',
+            to: "b".to_string(),
+            to_orient: '+',
+        };
+        let key_da = SkeletonLinkKey {
+            from: "d".to_string(),
+            from_orient: '-',
+            to: "a".to_string(),
+            to_orient: '-',
+        };
+        let mut links = HashMap::new();
+        insert_mito_stable_supported_link_pair(
+            &config,
+            &mut links,
+            key_ab.clone(),
+            SkeletonLinkSupport {
+                skeleton_support: config.min_link_support,
+                ..SkeletonLinkSupport::default()
+            },
+        );
+        insert_mito_stable_supported_link_pair(
+            &config,
+            &mut links,
+            key_db.clone(),
+            SkeletonLinkSupport {
+                skeleton_support: config.min_link_support,
+                ..SkeletonLinkSupport::default()
+            },
+        );
+        insert_mito_stable_supported_link_pair(
+            &config,
+            &mut links,
+            key_da,
+            SkeletonLinkSupport {
+                skeleton_support: config.min_link_support,
+                ..SkeletonLinkSupport::default()
+            },
+        );
+        insert_mito_stable_supported_link_pair(
+            &config,
+            &mut links,
+            key_ac.clone(),
+            SkeletonLinkSupport {
+                paf_support: config.skeleton_min_link_support + 1,
+                ..SkeletonLinkSupport::default()
+            },
+        );
+        refresh_skeleton_link_ratios(&config, &mut links);
+        let candidates = vec![MitoCompactBridgeCandidate {
+            key: key_bc.clone(),
+            support: config.skeleton_min_link_support + 5,
+            source: MitoCompactBridgeSource::LocalPaf,
+        }];
+        let mut depth = HashMap::new();
+
+        let expansions = expand_mito_stable_repeat_shortcuts(
+            &config,
+            &mut segments,
+            &mut depth,
+            &mut links,
+            &candidates,
+        );
+
+        assert_eq!(expansions.len(), 1);
+        assert_eq!(expansions[0].template, "b");
+        assert_eq!(expansions[0].shortcut_overlap, 0);
+        assert_eq!(expansions[0].left_overlap, 120);
+        assert_eq!(expansions[0].right_overlap, 120);
+        assert!(segments.iter().any(|segment| segment.name == "b_copy0"));
+        assert!(!links.contains_key(&key_ac));
+        assert!(!links.contains_key(&key_ab));
+        assert!(skeleton_link_is_kept(
+            &config,
+            &links,
+            &SkeletonLinkKey {
+                from: "a".to_string(),
+                from_orient: '+',
+                to: "b_copy0".to_string(),
+                to_orient: '+',
+            },
+        ));
+        assert!(skeleton_link_is_kept(
+            &config,
+            &links,
+            &SkeletonLinkKey {
+                from: "b_copy0".to_string(),
+                from_orient: '+',
+                to: "c".to_string(),
+                to_orient: '+',
+            },
+        ));
+        assert!(skeleton_link_is_kept(&config, &links, &key_db));
+    }
+
+    #[test]
+    fn mito_stable_detects_new_three_way_nodes() {
+        let config = Config::from_args(
+            ["simple_draft_asm", "-p", "mx", "-i", "reads.fastq.gz"]
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        )
+        .unwrap();
+        let before_segments = ["a", "b", "c", "d", "e", "x"]
+            .iter()
+            .map(|name| SkeletonSegment {
+                name: (*name).to_string(),
+                sequence: "AAAA".to_string(),
+            })
+            .collect::<Vec<_>>();
+        let mut after_segments = before_segments.clone();
+        after_segments.push(SkeletonSegment {
+            name: "b_copy0".to_string(),
+            sequence: "AAAA".to_string(),
+        });
+
+        let mut before_links = HashMap::new();
+        let mut after_links = HashMap::new();
+        let support = SkeletonLinkSupport {
+            skeleton_support: config.min_link_support,
+            ..SkeletonLinkSupport::default()
+        };
+        let add = |links: &mut HashMap<SkeletonLinkKey, SkeletonLinkSupport>,
+                   from: &str,
+                   from_orient: char,
+                   to: &str,
+                   to_orient: char| {
+            insert_mito_stable_supported_link_pair(
+                &config,
+                links,
+                SkeletonLinkKey {
+                    from: from.to_string(),
+                    from_orient,
+                    to: to.to_string(),
+                    to_orient,
+                },
+                support.clone(),
+            );
+        };
+
+        for (from, from_orient, to, to_orient) in [
+            ("a", '+', "b", '+'),
+            ("x", '+', "b", '+'),
+            ("b", '+', "d", '+'),
+            ("b", '+', "e", '+'),
+            ("a", '+', "c", '+'),
+        ] {
+            add(&mut before_links, from, from_orient, to, to_orient);
+        }
+        for (from, from_orient, to, to_orient) in [
+            ("x", '+', "b", '+'),
+            ("b", '+', "d", '+'),
+            ("b", '+', "e", '+'),
+            ("a", '+', "b_copy0", '+'),
+            ("b_copy0", '+', "c", '+'),
+        ] {
+            add(&mut after_links, from, from_orient, to, to_orient);
+        }
+
+        assert!(
+            !mito_stable_three_way_nodes(&config, &before_segments, &before_links).contains("b")
+        );
+        let after_three_way = mito_stable_three_way_nodes(&config, &after_segments, &after_links);
+        assert_eq!(after_three_way, HashSet::from(["b".to_string()]));
+        assert!(mito_stable_introduces_new_three_way_nodes(
+            &config,
+            &before_segments,
+            &before_links,
+            &after_segments,
+            &after_links
+        ));
+        assert!(!mito_stable_node_constraints_ok_for_transition(
+            &config,
+            &before_segments,
+            &before_links,
+            &after_segments,
+            &after_links
+        ));
+
+        let mut allow_config = config.clone();
+        allow_config.mito_stable_allow_three_way = after_three_way;
+        assert!(mito_stable_node_constraints_ok_for_transition(
+            &allow_config,
+            &before_segments,
+            &before_links,
+            &after_segments,
+            &after_links
+        ));
+
+        let mut forbid_config = config.clone();
+        forbid_config
+            .mito_stable_forbid_three_way
+            .insert("b".to_string());
+        assert!(!mito_stable_node_constraints_ok(
+            &forbid_config,
+            &after_segments,
+            &after_links
+        ));
+        assert!(!mito_stable_node_constraints_ok_for_transition(
+            &forbid_config,
+            &before_segments,
+            &before_links,
+            &after_segments,
+            &after_links
+        ));
     }
 
     #[test]

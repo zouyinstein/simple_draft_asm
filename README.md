@@ -46,6 +46,7 @@ Use `--preset` or `-p` for the common organelle/profile combinations:
 | `ml` | `mito_low` | mitochondrial low-data mode, replacing the user-facing compact command |
 | `ms` | `mito_standard` | mitochondrial standard mode, including the default two-round skeleton workflow |
 | `mh` | `mito_high` | mitochondrial high-data mode: standard mode plus `--min-link-ratio 0.30 --subsets=25,50,100` |
+| `mx` | `mito_stable`, `mito_complex` | full mitochondrial complex-repeat mode with internal-junction splitting and stable bridge selection |
 | `pl` | `plastid_low` | plastid low-data mode, replacing the user-facing compact command |
 | `ps` | `plastid_standard` | plastid standard mode, keeping the plastid one-round workflow |
 | `ph` | `plastid_high` | plastid high-data mode: standard mode plus `--min-link-ratio 0.30 --subsets=25,50,100` |
@@ -91,6 +92,200 @@ main topology without creating high-degree secondary branching. Unsupported
 small components are omitted from the final main graph rather than force-linked.
 This compact-mito completion path does not change plastid compact mode or the
 standard large-data mito/plastid profiles.
+
+## Operating Logic
+
+Start with standard mode unless the data volume already tells you otherwise.
+Plastid standard mode is a one-round dominant graph workflow. Mitochondrial
+standard mode is two-round: the first round builds a conservative skeleton and
+the second round remaps reads to that skeleton to extend/rescue supported open
+graph structure.
+
+Use compact mode only for genuinely small corrected-read inputs. Randomly
+sampling 500 or 1000 raw reads from a large mitochondrial dataset is not a
+replacement for the full standard run; on `data/Col-0_mito.fastq.gz`, 500-read
+and 1000-read compact tests did not match the full standard topology.
+
+Use high-data mode for very large datasets when weak secondary links need to be
+controlled by read subsetting and link filtering:
+
+```bash
+./target/release/simple_draft_asm -p mh \
+  -i data/mito.fastq.gz \
+  -o result_mito_high \
+  -t 8
+```
+
+When a mitochondrial standard graph has suspicious `1-2` or `2-1` nodes, use
+`mx` to analyze or repair only the selected repeat neighborhood rather than
+continuing to tune global thresholds.
+
+## Experimental Mito Stable Mode
+
+Use `-p mx` for mitochondrial datasets where the normal standard graph may be
+closed but repeat topology is unstable. The recommended workflow is manual: run
+standard `ms` first, inspect the graph, then rerun `mx` when the standard graph
+has suspicious repeat-node structure or sample-to-sample instability.
+
+```bash
+./target/release/simple_draft_asm -p ms \
+  -i data/CRR958891_mito.fastq.gz \
+  -o result_crr_mito_ms \
+  -t 8
+
+./target/release/simple_draft_asm -p mx \
+  -i data/CRR958891_mito.fastq.gz \
+  -o result_crr_mito_mx \
+  -t 8
+```
+
+The `mx` rerun is not a global threshold sweep. It changes the topology search
+itself:
+
+1. Build the normal mitochondrial two-round skeleton, including the first-pass
+   read-walk rescue graph.
+2. Remap all reads to the skeleton and look for strong internal split points
+   inside existing segments, not only at segment ends.
+3. Split skeleton segments at supported internal junctions and remap reads when
+   new breakpoints are found.
+4. Build a candidate graph from existing skeleton links, PAF links, local
+   read-supported bridges, and rescue-graph links.
+5. For paired `1-2`/`2-1` nodes, test whether their single sides are already
+   connected through a short `2-2` bridge-chain. When the bridge-chain support
+   strongly dominates single-copy reconnect alternatives, add the direct
+   double-copy chord.
+6. Score candidate bridge sets globally by connectedness, open ends, endpoint
+   overload, branch count, cycle rank, link count, and support.
+7. Keep only bridges that improve the main topology without creating excessive
+   secondary links.
+8. Apply repeat-aware shortcut replacement when a short local chain can explain
+   an otherwise ambiguous connection while preserving valid node degrees.
+9. Prune closed redundant links only after confirming the graph remains
+   connected, closed, and within degree guards.
+
+`mx` has three user-facing modes:
+
+- `--mx-mode auto`: full automatic mito-stable search. This can add bridges,
+  perform repeat-aware shortcut replacement, and prune redundant closed links.
+- `--mx-mode forbid-selected --selected-nodes LIST`: only analyze the selected
+  nodes and try to repair those nodes with local candidate bridges. Automatic
+  repeat expansion and pruning are disabled in this mode.
+- `--mx-mode allow-selected --selected-nodes LIST`: analyze the selected nodes
+  without changing the graph. This is useful when deciding whether selected
+  `1-2`/`2-1` nodes should remain as repeat-copy structure.
+
+For example, to test whether `edge_12` and `edge_17` should be repaired:
+
+```bash
+./target/release/simple_draft_asm -p mx \
+  --skeleton-gfa data/check/all_mito_500K_before_rr.gfa \
+  -i data/CRR958891_mito.fastq.gz \
+  -o benchmarks/crr_mx_repair_20260613/forbid_edge12_edge17 \
+  -t 8 \
+  --mx-mode forbid-selected \
+  --selected-nodes edge_12,edge_17
+```
+
+To inspect whether `edge_4` and `edge_8` are better interpreted as retained
+repeat-copy nodes:
+
+```bash
+./target/release/simple_draft_asm -p mx \
+  --skeleton-gfa data/check/all_mito_500K_before_rr.gfa \
+  -i data/CRR958891_mito.fastq.gz \
+  -o benchmarks/crr_mx_repair_20260613/allow_edge4_edge8 \
+  -t 8 \
+  --mx-mode allow-selected \
+  --selected-nodes edge_4,edge_8
+```
+
+For unstable mitochondrial repeat data, this is meant to separate stable
+regions from unstable repeat neighborhoods and then solve those neighborhoods
+with local split/bridge/repeat repair. The topology scan treats node names as
+graph-local identifiers; compare roles, degrees, neighbors, and sequence
+placement between runs rather than assuming names are stable.
+
+The main `mx` diagnostics are:
+
+- `mito_stable_splits.tsv`: internal breakpoints used to expose hidden branch
+  endpoints.
+- `mito_stable_bridge.candidates.tsv` and `mito_stable_bridge.selected.tsv`:
+  tested and accepted bridge links.
+- `mito_stable_bridge.report.txt`: topology score summary for the selected
+  bridge set.
+- `mito_stable_selected_nodes.tsv`: selected node degree, incident base links,
+  and incident read-supported candidates.
+- `mito_stable_copy_choice.tsv`: local single-copy versus double-copy
+  interpretations for three-way node pairs, including added-link support,
+  support source such as `read_walk` or `bridge_chain:*`, and topology outcome.
+- `mito_stable_node_degrees.tsv`: physical left/right degree class per final
+  node.
+- `mito_stable_node_repairs.tsv`: before/after degree class and repair events
+  for nodes changed by selected bridges, manual edits, pruning, or repeat
+  expansion.
+- `mito_stable_topology_scan.tsv`: final node-role scan, including accepted
+  three-way merge candidates and invalid node shapes.
+- `mito_stable_manual_edits.tsv`: advanced forced/dropped link edits, when
+  supplied.
+- `mito_stable_repeat_expansions.tsv`: repeat-aware shortcut replacements.
+- `mito_stable_pruned.tsv`: redundant links removed after topology validation.
+
+If you already have an incomplete or suspicious GFA and want to repair that
+specific graph, add `--skeleton-gfa`; this is an input graph to inspect and
+repair, not a topology reference:
+
+```bash
+./target/release/simple_draft_asm -p mx \
+  --skeleton-gfa result_crr_mito_ms/graph.gfa \
+  -i data/CRR958891_mito.fastq.gz \
+  -o result_crr_mito_mx_from_gfa \
+  -t 8
+```
+
+Advanced `--force-link` and `--drop-link` options remain available as local
+graph-edit controls. They use `from:from_orient:to:to_orient` syntax, for
+example `edge_8:-:edge_4:-`, and are recorded in
+`mito_stable_manual_edits.tsv`.
+
+The manual two-step repeat audit remains useful when reviewing a suspicious GFA:
+first run `forbid-selected` on `edge_12,edge_17`, then run `forbid-selected` on
+`edge_4,edge_8` from that repaired graph. The second run only lists
+`edge_8:-:edge_4:-` as selected because `edge_17:-:edge_12:-` is already
+present in its input graph; the two steps together make both repeat cassettes
+`2-2`.
+
+The current direct CRR reruns show the bridge-chain behavior from direct `ms`
+graphs. `mx auto` resolves CRR958891 by adding `utg12:+:utg14:+` through the
+`utg13` bridge-chain and `utg17:+:utg20:+` through the `utg21` bridge-chain.
+The same motif also triggers on CRR958893, adding `utg12:-:utg14:+` through
+`utg13` and `utg0:+:utg18:+` through `utg19`. See each run's
+`mito_stable_copy_choice.tsv` for support and source.
+
+For CRR958891, use
+`CRR958891_mx_auto_from_cleaned_ms/graph.gfa`
+as the final graph. The cleaned input drops `utg10` because its `ms` depth is 0,
+and drops the manually rejected `utg8--utg26` direct link before `mx auto`.
+This keeps sample-level cleanup separate from `mx`: `mx auto` then only adds
+the two repeat-cassette chords `utg12:+:utg14:+` and `utg17:+:utg20:+`.
+
+Why the `utg17--utg20` direct link is easy to lose in `ms`: the evidence is
+not absent, but the standard graph representation assigns it to the intervening
+short repeat bridge `utg21`. In the CRR958891 `ms` graph, `utg21` is 1,520 bp
+and the retained links are very strong:
+
+```text
+utg17:+ -> utg21:-  skeleton 146, PAF 117
+utg21:- -> utg20:+  skeleton 140, PAF 127
+```
+
+The direct chord `utg17:+ -> utg20:+` only appears as a weak raw candidate in
+`links.tsv` with PAF support 3 and link ratios about 0.02, so it does not pass
+the normal `ms` graph filters and is absent from `ms/graph.gfa`. Biologically
+and topologically, however, this is the same double-copy cassette evidence:
+`utg17:R--utg21:R` plus `utg21:L--utg20:L` says the two single sides are joined
+through a short `2-2` bridge. `mx auto` therefore converts that bridge-chain
+support into the direct double-copy chord, writing
+`utg17:+:utg20:+` with support 140 and `support_source=bridge_chain:utg21`.
 
 ## Link sensitivity
 
@@ -188,6 +383,24 @@ diagnostics:
   removed from the final main topology.
 - `mito_compact_bridge.read_ids.txt` and `mito_compact_bridge.reads.fasta`:
   reads selected for local bridge inspection.
+
+For experimental mito-stable runs, `round2_skeleton/` and the top-level output
+also include:
+
+- `mito_stable_splits.tsv`: high-support internal skeleton breakpoints used to
+  expose hidden branch endpoints before final bridge selection.
+- `mito_stable_bridge.report.txt`: global bridge-selection topology summary.
+- `mito_stable_bridge.candidates.tsv` and `mito_stable_bridge.selected.tsv`:
+  candidate and accepted bridge links after internal splitting.
+- `mito_stable_node_degrees.tsv`: physical left/right degree class for each
+  final node.
+- `mito_stable_topology_scan.tsv`: self-check of node roles; highlights
+  accepted three-way merge candidates through small `2-2` repeat bridges,
+  ordinary `2-2` repeat nodes, linear nodes, and invalid node shapes.
+- `mito_stable_repeat_expansions.tsv`: copied repeat segments used to replace
+  low-overlap shortcut links with local high-overlap chains; this file can be
+  empty when node-degree constraints reject the repair.
+- `mito_stable_pruned.tsv`: closed redundant links removed after repeat repair.
 
 ## Current validation
 
